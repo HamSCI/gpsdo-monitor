@@ -1,9 +1,11 @@
 # Sigmond deploy manifest for gpsdo-monitor.
 #
 # gpsdo-monitor is an `infra` client (like igmp-querier) — it does not
-# conform to the v0.4 client contract (no inventory/validate
-# subcommands), but sigmond can still install, start, stop, and
-# monitor its one systemd unit.
+# conform to the full client contract (no validate, no per-instance
+# inventory), but sigmond can still install, start, stop, and monitor
+# its one systemd unit.  It DOES implement a minimal `inventory --json`
+# reporting only the CONTRACT §3 hardware_present field (Phase D), so
+# sigmond can mark it core-but-dormant when no GPSDO is attached.
 
 [package]
 name             = "gpsdo-monitor"

@@ -126,6 +126,28 @@ def _sample_pps(serial: str, duration_sec: float) -> PpsStudy:
         return PpsStudy()
 
 
+def _cmd_inventory(_args: argparse.Namespace) -> int:
+    """CONTRACT §3 / sigmond install-orchestration Phase D — minimal
+    self-describe so sigmond can learn whether a monitorable GPSDO is
+    attached without probing USB itself.  gpsdo-monitor is a v0.4 infra
+    client (no per-instance inventory); this reports only the hardware
+    dimension.  hardware_present is True when at least one Leo Bodnar HID
+    device is enumerable, False when none, null if HID enumeration errors.
+    JSON only on stdout (logging goes to stderr)."""
+    try:
+        present: bool | None = bool(enumerate_lbe())
+    except Exception:                                  # noqa: BLE001
+        present = None
+    payload = {
+        "client":           "gpsdo-monitor",
+        "version":          __version__,
+        "contract_version": "0.8",
+        "hardware_present": present,
+    }
+    print(json.dumps(payload, indent=2))
+    return 0
+
+
 def _cmd_serve(args: argparse.Namespace) -> int:
     from gpsdo_monitor.service import Service
     cfg = Config.from_file(Path(args.config) if args.config else None)
@@ -177,6 +199,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="seconds to count DCD 1PPS edges before reporting (default 3.0; 0 disables)",
     )
     sp.set_defaults(func=_cmd_status)
+
+    sp = sub.add_parser("inventory", help="self-describe as JSON (CONTRACT §3 hardware_present)")
+    sp.add_argument("--json", action="store_true",
+                    help="emit JSON (always JSON; flag accepted for contract symmetry)")
+    sp.set_defaults(func=_cmd_inventory)
 
     sp = sub.add_parser("serve", help="run the long-lived probe daemon (systemd)")
     sp.set_defaults(func=_cmd_serve)
