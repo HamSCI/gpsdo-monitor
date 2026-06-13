@@ -31,6 +31,11 @@ class NmeaState:
     sats_used: int | None = None
     last_rmc_valid_wall: float | None = None   # time.time() of latest RMC with status 'A'
     bad_checksum_count: int = 0
+    # Most recent position fix (decimal degrees; +N/+E). Captured from RMC
+    # (validity-gated) and GGA. Lets a Leo Bodnar (or any NMEA GPSDO) seed the
+    # station's grid square at install time — see maidenhead().
+    latitude: float | None = None
+    longitude: float | None = None
     # Integer UTC second the most recent RMC-valid sentence describes,
     # paired with time.monotonic() at the moment that sentence was read.
     # The pair is what hf-timestd's T5 disambig consumes — sub-second
@@ -49,6 +54,66 @@ class NmeaState:
             return None
         t = now if now is not None else time.time()
         return max(0.0, t - self.last_rmc_valid_wall)
+
+    def maidenhead(self, precision: int = 6) -> str | None:
+        """The current fix as a Maidenhead locator, or None if no position."""
+        if self.latitude is None or self.longitude is None:
+            return None
+        return to_maidenhead(self.latitude, self.longitude, precision)
+
+
+def _parse_coord(raw: str, hemi: str) -> float | None:
+    """Convert an NMEA ddmm.mmmm / dddmm.mmmm + hemisphere to decimal degrees.
+
+    Returns None on malformed input. Latitude uses 2 degree digits, longitude
+    3; we infer the split from the position of the decimal point (minutes are
+    always the two digits before it), so one parser handles both.
+    """
+    if not raw or "." not in raw:
+        return None
+    try:
+        dot = raw.index(".")
+        deg = int(raw[: dot - 2])
+        minutes = float(raw[dot - 2:])
+    except (ValueError, IndexError):
+        return None
+    val = deg + minutes / 60.0
+    if hemi in ("S", "W"):
+        val = -val
+    return val
+
+
+def to_maidenhead(lat: float, lon: float, precision: int = 6) -> str:
+    """Decimal-degree lat/lon → Maidenhead grid locator.
+
+    precision is the number of characters (4, 6, 8, …); 6 ("EM38ww") is the
+    usual station default. Field/square/subsquare/extended pairs alternate
+    letters and digits per the standard.
+    """
+    lat = max(-90.0, min(90.0, lat)) + 90.0
+    lon = max(-180.0, min(180.0, lon)) + 180.0
+    out = []
+    # Field (A-R): 20° lon, 10° lat
+    out.append(chr(ord("A") + int(lon // 20)))
+    out.append(chr(ord("A") + int(lat // 10)))
+    lon %= 20.0
+    lat %= 10.0
+    # Square (0-9): 2° lon, 1° lat
+    out.append(str(int(lon // 2)))
+    out.append(str(int(lat // 1)))
+    lon %= 2.0
+    lat %= 1.0
+    # Subsquare (a-x): 5' lon, 2.5' lat
+    out.append(chr(ord("a") + int(lon / (2.0 / 24))))
+    out.append(chr(ord("a") + int(lat / (1.0 / 24))))
+    lon %= (2.0 / 24)
+    lat %= (1.0 / 24)
+    # Extended square (0-9), and beyond if asked
+    while len(out) < precision:
+        out.append(str(int(lon / (2.0 / 240))))
+        out.append(str(int(lat / (1.0 / 240))))
+        break
+    return "".join(out[:precision])
 
 
 def checksum_ok(line: str) -> bool:
@@ -107,6 +172,12 @@ def feed(state: NmeaState, line: str, *, now: float | None = None) -> None:
         # status 'A' = active/valid, 'V' = void.
         if len(fields) > 9 and fields[2] == "A":
             state.last_rmc_valid_wall = t
+            # Position (fields: 3=lat, 4=N/S, 5=lon, 6=E/W).
+            lat = _parse_coord(fields[3], fields[4])
+            lon = _parse_coord(fields[5], fields[6])
+            if lat is not None and lon is not None:
+                state.latitude = lat
+                state.longitude = lon
             time_str = fields[1]
             date_str = fields[9]
             try:
@@ -131,6 +202,18 @@ def feed(state: NmeaState, line: str, *, now: float | None = None) -> None:
                 n = None
             if n is not None:
                 state.sats_used = n
+            # Position (fields: 2=lat, 3=N/S, 4=lon, 5=E/W) — fills in when no
+            # RMC has been seen yet; quality 0 leaves lat/lon empty.
+            try:
+                quality = int(fields[6])
+            except (ValueError, IndexError):
+                quality = 0
+            if quality > 0:
+                lat = _parse_coord(fields[2], fields[3])
+                lon = _parse_coord(fields[4], fields[5])
+                if lat is not None and lon is not None:
+                    state.latitude = lat
+                    state.longitude = lon
     elif sentence == "GSA":
         # $xxGSA,mode1,mode2,prn1..prn12,pdop,hdop,vdop
         # mode2: 1=no fix, 2=2D, 3=3D.

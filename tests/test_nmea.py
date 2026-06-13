@@ -1,7 +1,7 @@
 """Unit tests for the NMEA parser and state accumulator."""
 import time
 
-from gpsdo_monitor.nmea import NmeaState, checksum_ok, feed
+from gpsdo_monitor.nmea import NmeaState, checksum_ok, feed, to_maidenhead
 
 
 def _with_cs(body: str) -> str:
@@ -139,3 +139,41 @@ def test_nmea_reader_survives_repeated_open_failures():
         assert "nonexistent" in reader.open_error
     finally:
         reader.stop()
+
+
+# --- Position capture + Maidenhead (lets a Bodnar seed the station grid) ---
+
+def test_rmc_populates_position():
+    st = NmeaState()
+    feed(st, RMC_VALID)
+    assert st.latitude is not None and st.longitude is not None
+    assert abs(st.latitude - 38.9187) < 0.001
+    assert abs(st.longitude - (-92.1276)) < 0.001
+    assert st.maidenhead(6) == "EM38ww"
+
+
+def test_gga_populates_position():
+    st = NmeaState()
+    feed(st, GGA_FIX)
+    assert st.latitude is not None and st.longitude is not None
+    assert st.maidenhead(6) == "EM38ww"
+
+
+def test_gga_no_fix_leaves_position_none():
+    st = NmeaState()
+    feed(st, _with_cs("GNGGA,024825.40,,,,,0,00,,,M,,M,,0000"))
+    assert st.latitude is None and st.longitude is None
+    assert st.maidenhead() is None
+
+
+def test_to_maidenhead_known_points():
+    # field/square/subsquare correctness against well-known locators
+    assert to_maidenhead(38.9187, -92.1277, 6) == "EM38ww"
+    assert to_maidenhead(51.5, -0.1, 4) == "IO91"          # London
+    assert to_maidenhead(-33.86, 151.21, 4) == "QF56"      # Sydney (S/E)
+    assert to_maidenhead(0.0, 0.0, 4) == "JJ00"            # equator/prime-meridian
+
+
+def test_maidenhead_precision_arg():
+    assert len(to_maidenhead(38.9187, -92.1277, 4)) == 4
+    assert len(to_maidenhead(38.9187, -92.1277, 8)) == 8
