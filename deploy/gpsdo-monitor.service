@@ -1,6 +1,6 @@
 [Unit]
 Description=Leo Bodnar GPSDO Monitor
-Documentation=https://github.com/mijahauan/gpsdo-monitor
+Documentation=https://github.com/HamSCI/gpsdo-monitor
 After=systemd-udev-settle.service
 Wants=systemd-udev-settle.service
 

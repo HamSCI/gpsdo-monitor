@@ -8,7 +8,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 configurator for [Leo Bodnar](http://www.leobodnar.com/) GPS-disciplined
 clock sources (LBE-1420 / LBE-1421 / LBE-1423 / LBE-Mini).
 
-Its primary consumer is [`hf-timestd`](https://github.com/mijahauan/hf-timestd)'s
+Its primary consumer is [`hf-timestd`](https://github.com/HamSCI/hf-timestd)'s
 authority manager: gpsdo-monitor publishes an **actively probed A-level**
 signal that closes the "GPSDO is *probably* still disciplining the
 RX888 ADC" gap. The daemon also stands alone — it emits a simple file
@@ -21,7 +21,7 @@ cross-repo context.
 ## Authors
 
 - Michael Hauan (AC0G, GitHub: mijahauan)
-- Repo: https://github.com/mijahauan/gpsdo-monitor
+- Repo: https://github.com/HamSCI/gpsdo-monitor
 - Driver bytes ported from [`bvernoux/lbe-142x`](https://github.com/bvernoux/lbe-142x)
   (LBE-1420 / Mini code paths — see README for live-hardware coverage).
 

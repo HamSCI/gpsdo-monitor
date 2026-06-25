@@ -6,7 +6,7 @@ Health monitor, mDNS advertiser, and configurator for
 
 Built for the [HamSCI](https://hamsci.org) / sigmond SDR station suite:
 supplies an **actively probed A-level** signal to
-[`hf-timestd`](https://github.com/mijahauan/hf-timestd)'s authority
+[`hf-timestd`](https://github.com/HamSCI/hf-timestd)'s authority
 manager — closing the "GPSDO is *probably* still disciplining the RX888
 ADC" gap — but the daemon stands alone and emits a simple file + mDNS
 contract any consumer can read.
@@ -76,7 +76,7 @@ sudo smd install gpsdo-monitor
 ```
 
 The catalog entry in
-[`sigmond/etc/catalog.toml`](https://github.com/mijahauan/sigmond/blob/main/etc/catalog.toml)
+[`sigmond/etc/catalog.toml`](https://github.com/HamSCI/sigmond/blob/main/etc/catalog.toml)
 clones this repo to `/opt/git/sigmond/gpsdo-monitor` and runs `install.sh`.
 Add `[component.gpsdo-monitor] enabled = true` to
 `/etc/sigmond/topology.toml` if you want the full-suite walk (`smd
@@ -85,7 +85,7 @@ install` without args) to include it.
 ### Standalone
 
 ```sh
-git clone https://github.com/mijahauan/gpsdo-monitor /opt/git/sigmond/gpsdo-monitor
+git clone https://github.com/HamSCI/gpsdo-monitor /opt/git/sigmond/gpsdo-monitor
 sudo /opt/git/sigmond/gpsdo-monitor/install.sh
 ```
 
@@ -137,13 +137,13 @@ See [docs/TOPOLOGY.md](docs/TOPOLOGY.md) for concrete examples and
 
 ## Integration
 
-- **[hf-timestd](https://github.com/mijahauan/hf-timestd)**: when
+- **[hf-timestd](https://github.com/HamSCI/hf-timestd)**: when
   `[timing.authority_manager.gpsdo].enabled = true`, hf-timestd's
   `GpsdoProbe` reads `/run/gpsdo/*.json` every authority tick and
   supplies the `a_level_provider` that decides A1 vs A0. Any fresh
   device reporting `a_level_hint == "A1"` is sufficient; the authority
   manager cross-checks against T-level witnesses and can override.
-- **[sigmond](https://github.com/mijahauan/sigmond)**: the `harmonize`
+- **[sigmond](https://github.com/HamSCI/sigmond)**: the `harmonize`
   rule `gpsdo_governor_coverage` reads the same JSON drop and enforces
   exactly-one-governor-per-local-radiod (zero warns, multiple errors)
   on every `smd validate`. The TUI radiod screen has a deep-dive

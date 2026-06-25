@@ -44,8 +44,8 @@ tui = [
 gpsdo-monitor = "gpsdo_monitor.cli:main"
 
 [project.urls]
-Homepage = "https://github.com/mijahauan/gpsdo-monitor"
-Issues   = "https://github.com/mijahauan/gpsdo-monitor/issues"
+Homepage = "https://github.com/HamSCI/gpsdo-monitor"
+Issues   = "https://github.com/HamSCI/gpsdo-monitor/issues"
 "HID protocol reference" = "https://github.com/bvernoux/lbe-142x"
 
 [tool.setuptools.packages.find]
