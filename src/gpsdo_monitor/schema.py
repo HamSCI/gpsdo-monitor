@@ -44,6 +44,7 @@ class Health:
     latitude: float | None = None
     longitude: float | None = None
     grid: str | None = None
+    altitude_m: float | None = None
     antenna_ok: bool | None = None
     signal_loss_count: int | None = None
     gps_locked: bool | None = None      # HID status bit 0: GPS module reports lock

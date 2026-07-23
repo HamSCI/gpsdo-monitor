@@ -96,6 +96,7 @@ def _enrich_with_nmea(raw, serial: str, duration_sec: float) -> None:
     raw.health.latitude = st.latitude
     raw.health.longitude = st.longitude
     raw.health.grid = st.maidenhead()
+    raw.health.altitude_m = st.altitude_m
 
 
 def _enrich_firmware(model, raw):
