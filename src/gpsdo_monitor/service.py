@@ -159,6 +159,10 @@ class DeviceWorker:
             raw.health.fix_age_sec = ns.fix_age_sec(now=now)
             raw.health.pps_utc_sec = ns.pps_utc_sec
             raw.health.nmea_host_monotonic_at_read = ns.host_monotonic_at_read
+            raw.health.latitude = ns.latitude
+            raw.health.longitude = ns.longitude
+            raw.health.grid = ns.maidenhead()
+        raw.health.altitude_m = ns.altitude_m
 
         # PPS study: snapshot the rolling window. If tracker isn't
         # running (no CDC, or device config disabled it) fall back to a
@@ -239,6 +243,10 @@ class DeviceWorker:
             fix_age_sec=ns.fix_age_sec(now=now),
             pps_utc_sec=ns.pps_utc_sec,
             nmea_host_monotonic_at_read=ns.host_monotonic_at_read,
+            latitude=ns.latitude,
+            longitude=ns.longitude,
+            grid=ns.maidenhead(),
+            altitude_m=ns.altitude_m,
         )
         from gpsdo_monitor.schema import utc_now_iso
         new_report = dataclasses.replace(

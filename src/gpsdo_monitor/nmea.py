@@ -36,6 +36,9 @@ class NmeaState:
     # station's grid square at install time — see maidenhead().
     latitude: float | None = None
     longitude: float | None = None
+    # Altitude above mean sea level (metres), captured from GGA field 9.
+    # Comes free with the fix; PSWS/station config want the elevation.
+    altitude_m: float | None = None
     # Integer UTC second the most recent RMC-valid sentence describes,
     # paired with time.monotonic() at the moment that sentence was read.
     # The pair is what hf-timestd's T5 disambig consumes — sub-second
@@ -214,6 +217,12 @@ def feed(state: NmeaState, line: str, *, now: float | None = None) -> None:
                 if lat is not None and lon is not None:
                     state.latitude = lat
                     state.longitude = lon
+            # Altitude MSL (field 9, metres) — free with the fix; PSWS wants it.
+            try:
+                if len(fields) > 9 and fields[9]:
+                    state.altitude_m = float(fields[9])
+            except (ValueError, IndexError):
+                pass
     elif sentence == "GSA":
         # $xxGSA,mode1,mode2,prn1..prn12,pdop,hdop,vdop
         # mode2: 1=no fix, 2=2D, 3=3D.
