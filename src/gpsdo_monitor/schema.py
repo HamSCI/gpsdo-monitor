@@ -38,6 +38,12 @@ class Health:
     gps_fix: str | None = None          # "no_fix" | "2D" | "3D"
     sats_used: int | None = None
     fix_age_sec: float | None = None
+    # Position from the GPS fix (decimal degrees, +N/+E) + Maidenhead grid,
+    # captured from NMEA RMC/GGA — lets bring-up auto-derive station location
+    # from the GPSDO instead of hand-entering it.  None until a fix is acquired.
+    latitude: float | None = None
+    longitude: float | None = None
+    grid: str | None = None
     antenna_ok: bool | None = None
     signal_loss_count: int | None = None
     gps_locked: bool | None = None      # HID status bit 0: GPS module reports lock

@@ -93,6 +93,9 @@ def _enrich_with_nmea(raw, serial: str, duration_sec: float) -> None:
     raw.health.gps_fix = st.gps_fix
     raw.health.sats_used = st.sats_used
     raw.health.fix_age_sec = st.fix_age_sec()
+    raw.health.latitude = st.latitude
+    raw.health.longitude = st.longitude
+    raw.health.grid = st.maidenhead()
 
 
 def _enrich_firmware(model, raw):
