@@ -14,6 +14,8 @@ upstream is kept as a last-resort fallback.
 """
 from __future__ import annotations
 
+import dataclasses
+
 import threading
 import time
 from dataclasses import dataclass
@@ -360,14 +362,12 @@ class NmeaReader:
         """Return a shallow copy of the current state. Safe to call
         from any thread; each call materialises a fresh dataclass."""
         with self._lock:
-            return NmeaState(
-                gps_fix=self._state.gps_fix,
-                sats_used=self._state.sats_used,
-                last_rmc_valid_wall=self._state.last_rmc_valid_wall,
-                bad_checksum_count=self._state.bad_checksum_count,
-                pps_utc_sec=self._state.pps_utc_sec,
-                host_monotonic_at_read=self._state.host_monotonic_at_read,
-            )
+            # Copy EVERY field: the previous hand-enumerated copy silently
+            # dropped latitude/longitude/altitude_m when the position
+            # feature was added, so consumers always saw None (found on
+            # AC0G-B4 2026-08-05 — the parser filled the state, snapshot()
+            # threw the fix away).
+            return dataclasses.replace(self._state)
 
     # Backoff cap for the reopen-on-error loop.  Read errors during a
     # transient race (another process briefly opening the device) can
