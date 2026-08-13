@@ -165,14 +165,19 @@ def test_1421_set_frequency_out_of_range_rejected():
         m.set_frequency(1, 2_000_000_000)
 
 
-def test_1421_decodes_antenna_bias_current():
+def test_1421_leaves_antenna_bias_none():
+    """Bench gate not met: the DC-blocked antenna feed on our bench read
+    byte 23 as 0 both connected and open, so the 1421 decode is disabled
+    (see class docstring / PROTOCOL.md). Byte 23 is still captured in
+    raw_trailing_hex for the paper trail and for the upcoming 1425 driver,
+    which does decode it."""
     buf = _make_status_1421(
         raw_bitmap=PLL_LOCK_BIT | GPS_LOCK_BIT | ANT_OK_BIT,
         freq1_hz=10_000_000, freq2_hz=10_000_000, bias_ma=5,
     )
     model = Lbe1421(_FakeHid({0x4B: buf}))
     raw = model.get_status()
-    assert raw.health.antenna_bias_ma == 5
+    assert raw.health.antenna_bias_ma is None
     # Paper trail unchanged: trailing hex still starts at byte 21.
     assert raw.raw_trailing_hex.split()[2] == "05"
 

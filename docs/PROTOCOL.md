@@ -44,16 +44,26 @@ confirmation.
 | 18     | 1     | FLL mode (0 = PLL, 1 = FLL) |
 | 19     | 1     | OUT1 power (0 = normal, 1 = low) |
 | 20     | 1     | OUT2 power |
-| 21..22 | 2     | unmapped |
-| 23     | 1     | antenna bias current (mA) |
+| 21..22 | 2     | observed config-echo candidates (not decoded) — see note below |
+| 23     | 1     | candidate antenna bias current (mA) — **decode disabled**, not verified (see note below) |
 | 24..59 | 36    | **unmapped** — candidate region for host firmware string / build date; preserve as `raw_trailing_hex` for later reverse-engineering |
 
 Status bitmap bits (from `lbe_common.h`): PLL lock, antenna OK, OUT1
 enable, OUT2 enable, PPS enable.
 
-Byte 23 is documented per `ringof/lbe-142x` `docs/reverse/`; verification
-against a bench 1421 is pending Task 11's bench check (this note will be
-updated to "live-verified" once that check runs).
+Byte 23 is documented per `ringof/lbe-142x` (1425 docs) as a candidate
+bias-current field, but the 2026-08-13 bench check could not verify it:
+the bench's antenna feed is DC-blocked (splitter), so byte 23 read `0`
+with the antenna connected *and* disconnected, and `ANT_OK` never
+dropped — the gate ("plausible nonzero mA when connected") was not met.
+The decode is **disabled** (`Health.antenna_bias_ma` stays `None` for
+the 1421/1423) pending a bench check with a powered antenna feed.
+
+The same 2026-08-13 bench run observed bytes 21..22 as static across
+that check: `0x67` (u-blox M8 default GNSS mask: GPS+SBAS+Galileo+
+QZSS+GLONASS) and `0x02` (dynModel Stationary), mirroring the tail
+layout described in the 1425 docs. These are recorded as an
+observation only — not decoded into the schema.
 
 ### LBE-Mini (no Report ID)
 

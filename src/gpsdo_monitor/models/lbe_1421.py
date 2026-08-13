@@ -14,9 +14,14 @@ Status layout (Report ID 0x4B, 60 bytes):
   18      1     FLL mode (0 PLL, 1 FLL)
   19      1     OUT1 power (0 normal, 1 low)
   20      1     OUT2 power
-  21..22  2     unmapped
-  23      1     antenna bias current, mA (ringof/lbe-142x; bench
-                verification pending — see PROTOCOL.md)
+  21..22  2     observed config-echo candidates (not decoded): live 1421
+                read 0x67 (u-blox M8 default GNSS mask: GPS+SBAS+
+                Galileo+QZSS+GLONASS) and 0x02 (dynModel Stationary),
+                mirroring the 1425 tail layout
+  23      1     candidate bias-current byte (per ringof/lbe-142x 1425
+                docs) — could not be verified on our bench (DC-blocked
+                antenna feed reads 0 mA both connected and open);
+                decode disabled pending a bench with a powered antenna
   24..59  36    unmapped — preserved as raw_trailing_hex for later RE
 
 Set opcodes double as the HID Report ID; frequency u32 is written at
@@ -89,7 +94,6 @@ class Lbe1421(GpsdoModel):
         fll = bool(buf[18])
         pw1 = bool(buf[19])
         pw2 = bool(buf[20])
-        bias = buf[23]
 
         health = Health(
             pll_locked=bool(raw & PLL_LOCK_BIT),
@@ -97,7 +101,9 @@ class Lbe1421(GpsdoModel):
                              == (OUT1_EN_BIT | OUT2_EN_BIT),
             fll_mode=fll,
             antenna_ok=bool(raw & ANT_OK_BIT),
-            antenna_bias_ma=bias,
+            # antenna_bias_ma: decode disabled. Byte 23 was a candidate
+            # bias-current field (ringof/lbe-142x 1425 docs) but the bench
+            # check couldn't verify it — see class docstring / PROTOCOL.md.
             gps_locked=bool(raw & GPS_LOCK_BIT),
             # NMEA fields (gps_fix, sats_used, fix_age_sec) filled in
             # by the CDC reader coroutine in nmea.py.
