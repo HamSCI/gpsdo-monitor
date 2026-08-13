@@ -77,6 +77,67 @@ Additionally an aggregate file `/run/gpsdo/index.json` lists all
 presently-probed devices with `{serial, model, governs, a_level_hint,
 written_utc}` entries for fast TUI consumption.
 
+## Additive fields (added 2026-08-13, additive within v1)
+
+Three fields were added without a schema bump — old consumers ignore
+them; new consumers can rely on `schema=v1` still being accurate.
+
+### `health.antenna_bias_ma`
+
+`int` (mA) or `null`. Measured antenna bias current, where the model
+exposes it. Verification status varies per model — see
+`docs/PROTOCOL.md` for the byte-level detail:
+
+- **1420**: byte 12, per `ringof/lbe-142x` docs, not bench-verified here.
+- **1421 / 1423**: candidate byte 23, decode **disabled** — a
+  2026-08-13 bench check couldn't verify it (DC-blocked antenna feed).
+  Always `null` on these two models.
+- **1425**: byte 23, decoded — the `ringof/lbe-142x` 1425 doc verifies
+  it directly on 1425 hardware.
+- **Mini**: always `null` (no bias-current hardware).
+
+```jsonc
+"health": {
+  ...
+  "antenna_bias_ma": 3        // int mA, or null if unsupported/undecoded
+}
+```
+
+### `nav_clock`
+
+`object | null`. LBE-Mini only (parsed from UBX-NAV-CLOCK); `null` on
+every other model. The `note` field is a fixed string — always exactly:
+
+```
+u-blox receiver self-report; not an independent measurement
+```
+
+```jsonc
+"nav_clock": {
+  "clk_bias_ns":    1234,
+  "clk_drift_ns_s": -12,
+  "t_acc_ns":       30,
+  "f_acc_ps_s":     5,
+  "sampled_utc":    "2026-04-24T00:01:11.900Z",
+  "note":           "u-blox receiver self-report; not an independent measurement"
+}
+```
+
+### `receiver_config`
+
+`object | null`. LBE-1425 only — read-only GNSS-receiver configuration
+echoes decoded from the status report tail; `null` on every other
+model. Raw byte values as the device reports them; decoding
+`gnss_mask` into constellation names is left to the consumer.
+
+```jsonc
+"receiver_config": {
+  "gnss_mask":    71,          // raw byte; 0x47 default = GPS+SBAS+Galileo+GLONASS
+  "dyn_model":    2,           // raw byte; u-blox CFG-NAV5 dynModel echo
+  "nmea_enabled": true
+}
+```
+
 ## A-level mapping
 
 ```

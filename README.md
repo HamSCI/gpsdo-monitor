@@ -2,7 +2,7 @@
 
 Health monitor, mDNS advertiser, and configurator for
 [Leo Bodnar](http://www.leobodnar.com/) GPS-disciplined clock sources
-(LBE-1420, LBE-1421, LBE-1423, LBE-Mini).
+(LBE-1420, LBE-1421, LBE-1423, LBE-1425, LBE-Mini).
 
 Built for the [HamSCI](https://hamsci.org) / sigmond SDR station suite:
 supplies an **actively probed A-level** signal to
@@ -14,10 +14,15 @@ contract any consumer can read.
 ## Status
 
 Working on Linux (primary target: Debian 12+ / RX888-class Beelink EQ).
-Live-validated on the LBE-1421; the LBE-1420 and LBE-Mini drivers are
-ported from [bvernoux/lbe-142x](https://github.com/bvernoux/lbe-142x)
-and covered by byte-level unit tests, but have not yet been exercised
-against live hardware.
+Live-validated on the LBE-1421; the LBE-Mini's HID status parse,
+NAV-CLOCK read, and `set_frequency` have each been checkpointed against
+a bench unit (serial `A7D99EE165`). The LBE-1420 driver is ported from
+[bvernoux/lbe-142x](https://github.com/bvernoux/lbe-142x) and covered
+by byte-level unit tests but not yet exercised against live hardware.
+The LBE-1425 driver (monitoring only — see the feature matrix below)
+is *experimental — untested on hardware*, ported from
+[ringof/lbe-142x](https://github.com/ringof/lbe-142x) reverse-engineering
+notes.
 
 ## What it does
 
@@ -52,22 +57,37 @@ against live hardware.
 
 ## Hardware support matrix
 
-| Feature            | LBE-1420 | LBE-1421 | LBE-1423 | LBE-Mini |
-|--------------------|:--------:|:--------:|:--------:|:--------:|
-| HID status parse   | ✓        | ✓        | ✓        | ✓        |
-| NMEA fix / sats    | —        | ✓ CDC    | ✓ CDC    | ✓ NAV-PVT |
-| 1 PPS edge capture | —        | ✓ DCD    | ✓ DCD    | —        |
-| Firmware advisory  | —        | —        | —        | ✓ MON-VER |
-| OUT2               | —        | ✓        | ✓        | —        |
-| Drive strength (mA)| —        | —        | —        | 8/16/24/32 |
-| Max output         | 1.6 GHz  | 1.4 GHz  | 1.4 GHz  | 810 MHz  |
+| Feature              | LBE-1420 | LBE-1421 | LBE-1423 | LBE-1425*  | LBE-Mini |
+|----------------------|:--------:|:--------:|:--------:|:----------:|:--------:|
+| HID status parse     | ✓        | ✓        | ✓        | ✓          | ✓        |
+| NMEA fix / sats      | —        | ✓ CDC    | ✓ CDC    | ✓ CDC      | ✓ NAV-PVT |
+| 1 PPS edge capture   | —        | ✓ DCD    | ✓ DCD    | ✓ DCD      | —        |
+| Firmware advisory    | —        | —        | —        | —          | ✓ MON-VER |
+| OUT2                 | —        | ✓        | ✓        | ✓          | —        |
+| Drive strength (mA)  | —        | —        | —        | —          | 8/16/24/32 |
+| Antenna bias (mA)    | ✓†       | —        | —        | ✓‡         | —        |
+| Max output           | 1.6 GHz  | 1.4 GHz  | 1.4 GHz  | 1.4 GHz§   | 810 MHz  |
 
-`set_frequency` is implemented for the whole family. The Mini path
-solves the Si-synth divider chain in pure Python
-(`gpsdo_monitor/mini_pll.py`, ported from David Goncalves'
-ringof/lbe-142x, MIT) and was live-validated against a bench Mini.
-Mini frequency writes always persist (the hardware has no
-temporary-set opcode).
+`*` LBE-1425 support is *experimental — untested on hardware*; the
+protocol is ported from `ringof/lbe-142x` reverse-engineering docs, not
+bench-verified by us. `†` per `ringof/lbe-142x` docs, not bench-verified
+here. `‡` decode enabled per the `ringof/lbe-142x` 1425 doc, verified by
+David Goncalves on his own 1425 — not bench-verified here (the 1421's
+candidate byte 23 ships with its decode disabled; see
+[docs/PROTOCOL.md](docs/PROTOCOL.md)). `§` per 1421 protocol; the 1425
+doc notes asymmetric limits — unverified.
+
+`set_frequency` is implemented for the whole family (the 1425 inherits
+it unchanged from the 1421). The Mini path solves the Si-synth divider
+chain in pure Python (`gpsdo_monitor/mini_pll.py`, ported from David
+Goncalves' ringof/lbe-142x, MIT) and was live-validated against a bench
+Mini. `fin`, the synth's input reference, travels with every frequency
+write rather than being a wire constant: the solver hardcodes
+`fin = 97600` Hz per upstream, but at least one bench unit's factory
+state uses `fin = 95000` Hz instead — both work, since a raw-divider
+restore of a unit's factory registers preserves its own `fin` exactly,
+where re-solving would substitute 97600. Mini frequency writes always
+persist (the hardware has no temporary-set opcode).
 
 ## Install
 
@@ -157,7 +177,7 @@ See [docs/TOPOLOGY.md](docs/TOPOLOGY.md) for concrete examples and
 
 ```sh
 uv sync --extra dev --extra tui     # or: pip install -e '.[dev,tui]'
-uv run pytest -q                    # 99 tests; unit only, no hardware
+uv run pytest -q                    # 153 tests; unit only, no hardware
 ```
 
 The daemon path uses a fake pyserial + fake hidapi in
@@ -230,6 +250,12 @@ protocol reference.
 Earlier protocol work by Simon Unsworth
 ([simontheu/lbe-1420](https://github.com/simontheu/lbe-1420)) seeded
 the lbe-142x project.
+
+The 1420/1421 antenna-bias-current byte locations, the LBE-1425
+tail-byte map and driver, and the LBE-Mini clock-synth divider solver
+(`gpsdo_monitor/mini_pll.py`) are ported from David Goncalves'
+reverse-engineering work in
+[ringof/lbe-142x](https://github.com/ringof/lbe-142x) (MIT).
 
 ## License
 
