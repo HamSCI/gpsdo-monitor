@@ -5,6 +5,7 @@ from gpsdo_monitor.ubx import (
     CLS_MON,
     CLS_NAV,
     ID_MON_VER,
+    ID_NAV_CLOCK,
     ID_NAV_PVT,
     MiniHidFrame,
     build_message,
@@ -13,6 +14,7 @@ from gpsdo_monitor.ubx import (
     fletcher8,
     iter_messages,
     parse_mon_ver,
+    parse_nav_clock,
     parse_nav_pvt,
 )
 
@@ -241,3 +243,49 @@ def test_decode_mini_hid_frame_keepalive_flag():
 
 def test_decode_mini_hid_frame_short_returns_none():
     assert decode_mini_hid_frame(b"\x00") is None
+
+
+# --- NAV-CLOCK -----------------------------------------------------------
+
+
+def _nav_clock_payload(
+    *, itow_ms: int, clk_bias_ns: int, clk_drift_ns_s: int,
+    t_acc_ns: int, f_acc_ps_s: int,
+) -> bytes:
+    """Pack a 20-byte UBX-NAV-CLOCK payload (u-blox M8, PROTVER 18)."""
+    return (
+        itow_ms.to_bytes(4, "little")
+        + clk_bias_ns.to_bytes(4, "little", signed=True)
+        + clk_drift_ns_s.to_bytes(4, "little", signed=True)
+        + t_acc_ns.to_bytes(4, "little")
+        + f_acc_ps_s.to_bytes(4, "little")
+    )
+
+
+def test_parse_nav_clock_round_trip():
+    payload = _nav_clock_payload(
+        itow_ms=433_200_000, clk_bias_ns=-1234, clk_drift_ns_s=87,
+        t_acc_ns=25, f_acc_ps_s=310,
+    )
+    nc = parse_nav_clock(payload)
+    assert nc is not None
+    assert nc.itow_ms == 433_200_000
+    assert nc.clk_bias_ns == -1234          # signed survives
+    assert nc.clk_drift_ns_s == 87
+    assert nc.t_acc_ns == 25
+    assert nc.f_acc_ps_s == 310
+
+
+def test_parse_nav_clock_negative_drift():
+    nc = parse_nav_clock(_nav_clock_payload(
+        itow_ms=0, clk_bias_ns=5, clk_drift_ns_s=-42, t_acc_ns=1, f_acc_ps_s=1,
+    ))
+    assert nc is not None and nc.clk_drift_ns_s == -42
+
+
+def test_parse_nav_clock_short_payload_returns_none():
+    assert parse_nav_clock(b"\x00" * 19) is None
+
+
+def test_nav_clock_message_id():
+    assert ID_NAV_CLOCK == 0x22

@@ -2,10 +2,11 @@
 
 Scope: just enough to support the LBE-Mini's needs — frame the byte
 stream out of the HID interrupt-IN endpoint, extract whole UBX
-messages, and decode the two messages we care about (NAV-PVT for the
-fix, MON-VER for the module firmware string). Per-satellite NAV-SAT
-decoding is intentionally left out; for A-level classification we only
-need `fix_type` and the firmware advisory.
+messages, and decode the messages we care about (NAV-PVT for the
+fix, NAV-CLOCK for clock solution, MON-VER for firmware).
+Per-satellite NAV-SAT decoding is intentionally left out; for
+A-level classification we only need `fix_type` and the firmware
+advisory.
 
 Message framing:
 
@@ -25,6 +26,7 @@ UBX_SYNC_2 = 0x62
 
 CLS_NAV = 0x01
 ID_NAV_PVT = 0x07
+ID_NAV_CLOCK = 0x22
 ID_NAV_SAT = 0x35
 
 CLS_MON = 0x0A
@@ -133,6 +135,35 @@ def parse_nav_pvt(payload: bytes) -> NavPvt | None:
         lon_1e7=int.from_bytes(payload[24:28], "little", signed=True),
         lat_1e7=int.from_bytes(payload[28:32], "little", signed=True),
         hmsl_mm=int.from_bytes(payload[36:40], "little", signed=True),
+    )
+
+
+@dataclass
+class NavClock:
+    """Decoded UBX-NAV-CLOCK (receiver clock solution).
+
+    All values are the u-blox receiver's own estimate of its clock
+    state — a self-report, not an independent measurement. Byte map
+    confirmed against David Goncalves' ringof/lbe-142x --clocklog
+    decoder (MIT)."""
+
+    itow_ms: int          # GPS time of week of the solution
+    clk_bias_ns: int      # receiver clock bias (signed)
+    clk_drift_ns_s: int   # receiver clock drift (signed)
+    t_acc_ns: int         # time accuracy estimate
+    f_acc_ps_s: int       # frequency accuracy estimate
+
+
+def parse_nav_clock(payload: bytes) -> NavClock | None:
+    """Decode a 20-byte UBX-NAV-CLOCK payload. None on short buffer."""
+    if len(payload) < 20:
+        return None
+    return NavClock(
+        itow_ms=int.from_bytes(payload[0:4], "little"),
+        clk_bias_ns=int.from_bytes(payload[4:8], "little", signed=True),
+        clk_drift_ns_s=int.from_bytes(payload[8:12], "little", signed=True),
+        t_acc_ns=int.from_bytes(payload[12:16], "little"),
+        f_acc_ps_s=int.from_bytes(payload[16:20], "little"),
     )
 
 
