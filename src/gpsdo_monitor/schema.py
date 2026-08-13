@@ -46,6 +46,11 @@ class Health:
     grid: str | None = None
     altitude_m: float | None = None
     antenna_ok: bool | None = None
+    # Measured antenna bias current (mA) where the model exposes it
+    # (1420 byte 12, 1421/1425 byte 23 — per ringof/lbe-142x reverse
+    # docs). Distinguishes open (0 mA) from short (high) where the
+    # ANT_OK bit alone can't. Diagnostic only: never an A-level input.
+    antenna_bias_ma: int | None = None
     signal_loss_count: int | None = None
     gps_locked: bool | None = None      # HID status bit 0: GPS module reports lock
     # Integer UTC second of the latest RMC-valid sentence, paired with

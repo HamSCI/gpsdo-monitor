@@ -105,3 +105,47 @@ def test_gps_fix_primary_wins_over_gps_locked():
     )
     assert lvl == "A1"
     assert "gps_fix=3D" in reason
+
+
+def test_antenna_fault_reason_names_open_when_bias_zero():
+    h = Health(pll_locked=True, outputs_enabled=True,
+               gps_fix="3D", antenna_ok=False, antenna_bias_ma=0)
+    level, reason = classify(
+        h, PpsStudy(), probe_age_sec=0.0,
+        probe_interval_sec=10, pps_expected=False,
+    )
+    assert level == "A0"
+    assert reason == "antenna_fault (bias=0mA, open?)"
+
+
+def test_antenna_fault_reason_names_short_when_bias_nonzero():
+    h = Health(pll_locked=True, outputs_enabled=True,
+               gps_fix="3D", antenna_ok=False, antenna_bias_ma=63)
+    level, reason = classify(
+        h, PpsStudy(), probe_age_sec=0.0,
+        probe_interval_sec=10, pps_expected=False,
+    )
+    assert level == "A0"
+    assert reason == "antenna_fault (bias=63mA, short?)"
+
+
+def test_antenna_fault_reason_unchanged_without_bias():
+    h = Health(pll_locked=True, outputs_enabled=True,
+               gps_fix="3D", antenna_ok=False)
+    level, reason = classify(
+        h, PpsStudy(), probe_age_sec=0.0,
+        probe_interval_sec=10, pps_expected=False,
+    )
+    assert (level, reason) == ("A0", "antenna_fault")
+
+
+def test_bias_alone_never_downgrades():
+    # bias present + antenna_ok True: A-level logic must ignore bias.
+    h = Health(pll_locked=True, outputs_enabled=True,
+               gps_fix="3D", antenna_ok=True, fix_age_sec=1.0,
+               antenna_bias_ma=0)
+    level, _ = classify(
+        h, PpsStudy(), probe_age_sec=0.0,
+        probe_interval_sec=10, pps_expected=False,
+    )
+    assert level == "A1"

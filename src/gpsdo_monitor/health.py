@@ -45,7 +45,14 @@ def classify(
         # unreachable, kept for clarity
         return "A0", "gps_unavailable"
     if health.antenna_ok is False:
-        return "A0", "antenna_fault"
+        bias = health.antenna_bias_ma
+        if bias is None:
+            return "A0", "antenna_fault"
+        if bias == 0:
+            return "A0", "antenna_fault (bias=0mA, open?)"
+        # ANT_OK clears on over-current (1425 doc): nonzero bias with
+        # the fault bit set points at a short, not a missing antenna.
+        return "A0", f"antenna_fault (bias={bias}mA, short?)"
     if health.fix_age_sec is not None and health.fix_age_sec > FRESH_FIX_SEC:
         return "A0", f"fix_age_sec={health.fix_age_sec:.0f}"
     if probe_age_sec > 2 * probe_interval_sec:
