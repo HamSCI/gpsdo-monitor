@@ -92,10 +92,33 @@ class HidDevice:
         self._d.send_feature_report(bytes([report_id]) + payload)
 
     def feature_get(self, report_id: int, length: int = REPORT_SIZE) -> bytes:
-        """Read a Feature report. Returns a `length`-byte buffer whose indexing
-        matches upstream `lbe-142x/src/model_*.c`: buf[0] is the first byte
-        the device returns (an opcode/report-id echo on the 142x), so raw
-        status lives at buf[1], frequency at buf[6..9], etc."""
+        """Read a Feature report. Returns a `length`-byte payload buffer.
+
+        Two conventions, matching the wire:
+
+        - 142x family (report_id != 0, numbered reports): hidapi's
+          `get_feature_report(report_id, length)` returns exactly `length`
+          bytes, and buf[0] is the id/opcode echo the device sends back —
+          matching upstream `lbe-142x/src/model_*.c` indexing, so raw
+          status lives at buf[1], frequency at buf[6..9], etc.
+
+        - LBE-Mini (report_id == 0, no Report ID on the wire): hidapi
+          still prepends a report-id placeholder byte to the buffer it
+          returns, so we must ask for `length + 1` bytes — asking for only
+          `length` under-requests the kernel by one byte and stalls the
+          transfer on real hardware (verified live: OSError on every
+          attempt, plus usbhid interface resets in dmesg). We verify the
+          extra byte came back, then strip it so the returned buffer is
+          the `length`-byte payload verbatim: buf[0] here is the payload's
+          first byte, not an echo.
+        """
+        if report_id == 0:
+            buf = self._d.get_feature_report(report_id, length + 1)
+            if len(buf) != length + 1:
+                raise OSError(
+                    f"short feature-report read: got {len(buf)} bytes, expected {length + 1}"
+                )
+            return bytes(buf)[1:]
         buf = self._d.get_feature_report(report_id, length)
         if len(buf) != length:
             raise OSError(
