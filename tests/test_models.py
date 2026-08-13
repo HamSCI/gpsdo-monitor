@@ -48,6 +48,7 @@ def _make_status_1421(
     fll: bool = False,
     pw1_low: bool = False,
     pw2_low: bool = False,
+    bias_ma: int = 0,
 ) -> bytes:
     """Assemble a 60-byte status buffer matching upstream's layout.
 
@@ -61,6 +62,7 @@ def _make_status_1421(
     buf[18] = 1 if fll else 0
     buf[19] = 1 if pw1_low else 0
     buf[20] = 1 if pw2_low else 0
+    buf[23] = bias_ma
     return bytes(buf)
 
 
@@ -70,6 +72,7 @@ def _make_status_1420(
     freq1_hz: int,
     fll: bool = False,
     pw1_low: bool = False,
+    bias_ma: int = 0,
 ) -> bytes:
     """1420 layout: same report-id echo + status bitmap, same freq1
     offset, but power at buf[10] instead of buf[19]; no freq2; no PPS
@@ -80,6 +83,7 @@ def _make_status_1420(
     buf[6:10] = freq1_hz.to_bytes(4, "little")
     buf[10] = 1 if pw1_low else 0
     buf[18] = 1 if fll else 0
+    buf[12] = bias_ma
     return bytes(buf)
 
 
@@ -159,6 +163,18 @@ def test_1421_set_frequency_out_of_range_rejected():
     m = Lbe1421(_FakeHid({0x4B: buf}))
     with pytest.raises(ValueError):
         m.set_frequency(1, 2_000_000_000)
+
+
+def test_1421_decodes_antenna_bias_current():
+    buf = _make_status_1421(
+        raw_bitmap=PLL_LOCK_BIT | GPS_LOCK_BIT | ANT_OK_BIT,
+        freq1_hz=10_000_000, freq2_hz=10_000_000, bias_ma=5,
+    )
+    model = Lbe1421(_FakeHid({0x4B: buf}))
+    raw = model.get_status()
+    assert raw.health.antenna_bias_ma == 5
+    # Paper trail unchanged: trailing hex still starts at byte 21.
+    assert raw.raw_trailing_hex.split()[2] == "05"
 
 
 # --- 1420 -----------------------------------------------------------------
@@ -245,3 +261,13 @@ def test_1420_rejects_output_2():
         m.set_frequency(2, 10_000_000)
     with pytest.raises(ValueError, match="only has output 1"):
         m.set_power_level(2, True)
+
+
+def test_1420_decodes_antenna_bias_current():
+    buf = _make_status_1420(
+        raw_bitmap=PLL_LOCK_BIT | GPS_LOCK_BIT | ANT_OK_BIT,
+        freq1_hz=10_000_000, bias_ma=4,
+    )
+    model = Lbe1420(_FakeHid({0x4B: buf}))
+    raw = model.get_status()
+    assert raw.health.antenna_bias_ma == 4

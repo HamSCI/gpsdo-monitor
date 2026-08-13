@@ -23,6 +23,9 @@ Status layout (Report ID 0x4B, 60 bytes, same as 1421/1423):
                                bits 5..7 unused on 1420)
   6..9    4     frequency1 (Hz, u32 LE)
   10      1     OUT1 power (0 normal, 1 low)
+  12      1     antenna bias current, mA (per ringof/lbe-142x
+                LBE-1420-config-v1.08.md; NOT verified on our bench —
+                no local 1420)
   18      1     FLL mode (0 PLL, 1 FLL)
   21..59  39    unmapped — preserved as raw_trailing_hex
 """
@@ -80,6 +83,7 @@ class Lbe1420(GpsdoModel):
         f1  = _u32_le(buf, 6)
         pw1 = bool(buf[10])
         fll = bool(buf[18])
+        bias = buf[12]
 
         health = Health(
             pll_locked=bool(raw & PLL_LOCK_BIT),
@@ -90,6 +94,7 @@ class Lbe1420(GpsdoModel):
             outputs_enabled=True,
             fll_mode=fll,
             antenna_ok=bool(raw & ANT_OK_BIT),
+            antenna_bias_ma=bias,
             gps_locked=bool(raw & GPS_LOCK_BIT),
         )
         outputs = Outputs(

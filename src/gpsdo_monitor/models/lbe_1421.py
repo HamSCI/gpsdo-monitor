@@ -14,7 +14,10 @@ Status layout (Report ID 0x4B, 60 bytes):
   18      1     FLL mode (0 PLL, 1 FLL)
   19      1     OUT1 power (0 normal, 1 low)
   20      1     OUT2 power
-  21..59  39    unmapped — preserved as raw_trailing_hex for later RE
+  21..22  2     unmapped
+  23      1     antenna bias current, mA (ringof/lbe-142x; bench
+                verification pending — see PROTOCOL.md)
+  24..59  36    unmapped — preserved as raw_trailing_hex for later RE
 
 Set opcodes double as the HID Report ID; frequency u32 is written at
 payload offset 5 (not 1 as on the 1420). See upstream source for the
@@ -86,6 +89,7 @@ class Lbe1421(GpsdoModel):
         fll = bool(buf[18])
         pw1 = bool(buf[19])
         pw2 = bool(buf[20])
+        bias = buf[23]
 
         health = Health(
             pll_locked=bool(raw & PLL_LOCK_BIT),
@@ -93,6 +97,7 @@ class Lbe1421(GpsdoModel):
                              == (OUT1_EN_BIT | OUT2_EN_BIT),
             fll_mode=fll,
             antenna_ok=bool(raw & ANT_OK_BIT),
+            antenna_bias_ma=bias,
             gps_locked=bool(raw & GPS_LOCK_BIT),
             # NMEA fields (gps_fix, sats_used, fix_age_sec) filled in
             # by the CDC reader coroutine in nmea.py.

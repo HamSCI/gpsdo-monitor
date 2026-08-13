@@ -27,7 +27,12 @@ payload is 60 bytes with no prefix.
 |-------:|---------|
 | 1      | status bitmap (`PLL_LOCK`, `ANT_OK`, `OUT1_EN`, `OUT2_EN`, `PPS_EN`) |
 | 1..4   | frequency1 (u32 little-endian) on 1420 |
+| 12     | antenna bias current (mA; 0 = no antenna) |
 | …      | 1420 layout differs from 1421; see `src/model_1420.c` upstream |
+
+Byte 12 is documented per `ringof/lbe-142x` `docs/reverse/LBE-1420-config-v1.08.md`;
+unverified on our bench (no local 1420). David Goncalves offered bench
+confirmation.
 
 ### LBE-1421 / 1423 (Report ID `0x4B`)
 
@@ -39,10 +44,16 @@ payload is 60 bytes with no prefix.
 | 18     | 1     | FLL mode (0 = PLL, 1 = FLL) |
 | 19     | 1     | OUT1 power (0 = normal, 1 = low) |
 | 20     | 1     | OUT2 power |
-| 21..59 | 39    | **unmapped** — candidate region for host firmware string / build date; preserve as `raw_trailing_hex` for later reverse-engineering |
+| 21..22 | 2     | unmapped |
+| 23     | 1     | antenna bias current (mA) |
+| 24..59 | 36    | **unmapped** — candidate region for host firmware string / build date; preserve as `raw_trailing_hex` for later reverse-engineering |
 
 Status bitmap bits (from `lbe_common.h`): PLL lock, antenna OK, OUT1
 enable, OUT2 enable, PPS enable.
+
+Byte 23 is documented per `ringof/lbe-142x` `docs/reverse/`; verification
+against a bench 1421 is pending Task 11's bench check (this note will be
+updated to "live-verified" once that check runs).
 
 ### LBE-Mini (no Report ID)
 
@@ -93,3 +104,6 @@ For the Mini we emit the u-blox strings plus a computed
 - Upstream source: https://github.com/bvernoux/lbe-142x (MIT)
 - Mini reverse-engineering notes: `docs/reverse/LBE-Mini-config-v1.10.md`
   in the upstream repo (referenced from `include/lbe_common.h`).
+- Additional reverse-engineering notes: https://github.com/ringof/lbe-142x
+  (`docs/reverse/`) — source for the 1420 byte 12 / 1421 byte 23 antenna
+  bias current field.
