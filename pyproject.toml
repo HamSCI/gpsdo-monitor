@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "gpsdo-monitor"
-version = "0.1.0"
-description = "Health monitor, mDNS advertiser, and configurator for Leo Bodnar GPSDO clocks (LBE-1420/1421/1423/Mini)"
+version = "0.2.0"
+description = "Health monitor, mDNS advertiser, and configurator for Leo Bodnar GPSDO clocks (LBE-1420/1421/1423/1425/Mini)"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
