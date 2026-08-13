@@ -276,3 +276,33 @@ def test_1420_decodes_antenna_bias_current():
     model = Lbe1420(_FakeHid({0x4B: buf}))
     raw = model.get_status()
     assert raw.health.antenna_bias_ma == 4
+
+
+# --- 1425 -------------------------------------------------------------
+
+
+def test_1425_registry_dispatch():
+    from gpsdo_monitor.models.lbe_1425 import Lbe1425
+    from gpsdo_monitor.models.registry import REGISTRY
+
+    assert REGISTRY[0x2269] is Lbe1425
+    assert Lbe1425.name == "lbe-1425"
+
+
+def test_1425_decodes_tail_echoes():
+    from gpsdo_monitor.models.lbe_1425 import Lbe1425
+
+    buf = bytearray(_make_status_1421(
+        raw_bitmap=PLL_LOCK_BIT | GPS_LOCK_BIT | ANT_OK_BIT,
+        freq1_hz=10_000_000, freq2_hz=10_000_000, bias_ma=5,
+    ))
+    buf[21] = 0x47      # GNSS mask: GPS+SBAS+Galileo+GLONASS (1425 default)
+    buf[22] = 0x02      # dynModel: Stationary
+    buf[24] = 0x01      # NMEA output enabled
+    model = Lbe1425(_FakeHid({0x4B: bytes(buf)}))
+    raw = model.get_status()
+    assert raw.health.antenna_bias_ma == 5           # the 1425's own decode
+    assert raw.extras["receiver_config"] == {
+        "gnss_mask": 0x47, "dyn_model": 0x02, "nmea_enabled": True,
+    }
+    assert raw.health.pll_locked                     # 1421 parse still intact

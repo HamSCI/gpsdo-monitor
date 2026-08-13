@@ -21,6 +21,7 @@ PIDS: dict[int, str] = {
     0x2443: "lbe-1420",
     0x2444: "lbe-1421",
     0x226F: "lbe-1423",
+    0x2269: "lbe-1425",
     0x2211: "lbe-mini",
 }
 

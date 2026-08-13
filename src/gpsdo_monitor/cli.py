@@ -81,6 +81,9 @@ def _cmd_status(args: argparse.Namespace) -> int:
                 "f_acc_ps_s": nc.f_acc_ps_s,
                 "note": "u-blox receiver self-report; not an independent measurement",
             }
+        rc = raw.extras.get("receiver_config")
+        if rc is not None:
+            out["receiver_config"] = rc
         print(json.dumps(out, indent=2))
     return 0
 

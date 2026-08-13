@@ -88,6 +88,9 @@ class Lbe1421(GpsdoModel):
     # --- Read path -----------------------------------------------------
     def get_status(self) -> RawStatus:
         buf = self.hid.feature_get(STATUS_REPORT_ID, REPORT_SIZE)
+        return self._parse_status(buf)
+
+    def _parse_status(self, buf: bytes) -> RawStatus:
         raw = buf[1]
         f1  = _u32_le(buf, 6)
         f2  = _u32_le(buf, 14)

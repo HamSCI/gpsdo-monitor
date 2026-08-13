@@ -102,6 +102,18 @@ class NavClockReport:
 
 
 @dataclass
+class ReceiverConfig:
+    """Read-only GNSS-receiver configuration echoes (LBE-1425 only).
+
+    Raw values as the status report carries them; decoding the GNSS
+    bitmask into constellation names is the consumer's business."""
+
+    gnss_mask: int | None = None
+    dyn_model: int | None = None
+    nmea_enabled: bool | None = None
+
+
+@dataclass
 class FirmwareAdvisory:
     status: str                          # "current" | "outdated" | "unknown"
     protver: str | None = None
@@ -123,6 +135,7 @@ class DeviceReport:
     a_level_reason: str
     firmware_advisory: FirmwareAdvisory | None = None
     nav_clock: NavClockReport | None = None
+    receiver_config: ReceiverConfig | None = None
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), indent=2, sort_keys=False)
@@ -177,6 +190,7 @@ def new_report(
     a_level_reason: str,
     firmware_advisory: FirmwareAdvisory | None = None,
     nav_clock: NavClockReport | None = None,
+    receiver_config: ReceiverConfig | None = None,
 ) -> DeviceReport:
     return DeviceReport(
         schema=SCHEMA_VERSION,
@@ -192,4 +206,5 @@ def new_report(
         a_level_reason=a_level_reason,
         firmware_advisory=firmware_advisory,
         nav_clock=nav_clock,
+        receiver_config=receiver_config,
     )

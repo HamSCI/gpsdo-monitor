@@ -48,6 +48,7 @@ from gpsdo_monitor.schema import (
     IndexFile,
     NavClockReport,
     PpsStudy,
+    ReceiverConfig,
     atomic_write,
     new_report,
     utc_now_iso,
@@ -186,6 +187,11 @@ class DeviceWorker:
                 sampled_utc=utc_now_iso(),
             )
 
+        receiver_config = None
+        rc = raw.extras.get("receiver_config")
+        if rc is not None:
+            receiver_config = ReceiverConfig(**rc)
+
         if self.firmware is not None:
             raw.firmware = self.firmware
             raw.firmware_source = self.firmware_source
@@ -222,6 +228,7 @@ class DeviceWorker:
             a_level_reason=reason,
             firmware_advisory=self.firmware_advisory,
             nav_clock=nav_clock,
+            receiver_config=receiver_config,
         )
         self.last_report = report
         return report

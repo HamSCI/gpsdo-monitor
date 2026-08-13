@@ -102,3 +102,19 @@ def test_device_report_nav_clock_defaults_to_none_and_round_trips():
     parsed = json.loads(report.to_json())
     assert parsed["nav_clock"]["clk_bias_ns"] == 1
     assert "note" in parsed["nav_clock"]
+
+
+def test_receiver_config_round_trips_in_report():
+    import json
+
+    from gpsdo_monitor.schema import ReceiverConfig
+
+    report = _make_minimal_report()
+    assert report.receiver_config is None
+    report.receiver_config = ReceiverConfig(
+        gnss_mask=0x47, dyn_model=2, nmea_enabled=False,
+    )
+    parsed = json.loads(report.to_json())
+    assert parsed["receiver_config"] == {
+        "gnss_mask": 0x47, "dyn_model": 2, "nmea_enabled": False,
+    }
