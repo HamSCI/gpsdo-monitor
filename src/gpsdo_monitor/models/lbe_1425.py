@@ -19,7 +19,9 @@ doc verifies byte 23 directly on 1425 hardware, so this class sets
 
 The 1425's config opcodes (0x03 SET_GNSS, 0x04 SET_DYNMODEL, 0x0F
 SET_NMEA) are deliberately NOT implemented — gpsdo-monitor watches; it
-doesn't reconfigure receivers.
+doesn't reconfigure receivers. The frequency/output control opcodes
+inherited from the 1421 are likewise retained but unused: "monitoring-only"
+means no GNSS-receiver reconfiguration opcodes, not a fully inert driver.
 """
 from __future__ import annotations
 

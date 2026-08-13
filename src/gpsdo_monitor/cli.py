@@ -17,7 +17,7 @@ from gpsdo_monitor.config import Config
 from gpsdo_monitor.discovery import match
 from gpsdo_monitor.hid_xport import enumerate_lbe
 from gpsdo_monitor.models import open_model
-from gpsdo_monitor.schema import PpsStudy
+from gpsdo_monitor.schema import NAV_CLOCK_NOTE, PpsStudy, utc_now_iso
 
 
 def _setup_logging(verbose: bool) -> None:
@@ -79,7 +79,8 @@ def _cmd_status(args: argparse.Namespace) -> int:
                 "clk_drift_ns_s": nc.clk_drift_ns_s,
                 "t_acc_ns": nc.t_acc_ns,
                 "f_acc_ps_s": nc.f_acc_ps_s,
-                "note": "u-blox receiver self-report; not an independent measurement",
+                "sampled_utc": utc_now_iso(),
+                "note": NAV_CLOCK_NOTE,
             }
         rc = raw.extras.get("receiver_config")
         if rc is not None:

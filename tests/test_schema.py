@@ -63,7 +63,7 @@ def test_index_round_trip(tmp_path):
 
 def _make_minimal_report():
     device = Device(
-        model="lbe-mini", pid="0x2443", serial="LBEMINI-XYZ",
+        model="lbe-mini", pid="0x2211", serial="LBEMINI-XYZ",
         hid_path="/dev/hidraw3",
     )
     health = Health(pll_locked=True, outputs_enabled=True)
