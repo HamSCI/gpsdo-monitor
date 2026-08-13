@@ -302,6 +302,58 @@ def test_set_frequency_is_explicitly_not_implemented():
         mini.set_frequency(1, 10_000_000)
 
 
+def test_get_status_retains_newest_nav_clock():
+    from gpsdo_monitor.ubx import ID_NAV_CLOCK
+
+    def nav_clock_msg(bias_ns: int) -> bytes:
+        payload = (
+            (0).to_bytes(4, "little")
+            + bias_ns.to_bytes(4, "little", signed=True)
+            + (7).to_bytes(4, "little", signed=True)
+            + (25).to_bytes(4, "little")
+            + (300).to_bytes(4, "little")
+        )
+        return build_message(CLS_NAV, ID_NAV_CLOCK, payload)
+
+    # Two NAV-CLOCK messages: the sampler must keep the second.
+    stream = nav_clock_msg(-100) + nav_clock_msg(-250)
+    frames = []
+    for off in range(0, len(stream), 62):
+        chunk = stream[off : off + 62].ljust(62, b"\x00")
+        frames.append(_make_mini_hid_frame(
+            signal_loss=0, pll_locked=True, gps_signal=True,
+            carries_ubx=True, payload=chunk,
+        ))
+
+    feature = _make_feature_buf(
+        enabled=True, drive_idx=3,
+        fin=97_600, n3=1, n2hs=10, n2ls=6250, n1hs=5, nc1=122,
+    )
+    hid = _FakeMiniHid(
+        feature_get_replies=[feature, feature, feature],
+        interrupt_frames=frames,
+    )
+    mini = LbeMini(hid)
+    mini.nav_sample_sec = 0.1
+    raw = mini.get_status()
+    nc = raw.extras.get("nav_clock")
+    assert nc is not None
+    assert nc.clk_bias_ns == -250        # newest wins
+    assert nc.clk_drift_ns_s == 7
+
+
+def test_get_status_without_nav_clock_leaves_extras_empty():
+    feature = _make_feature_buf(
+        enabled=True, drive_idx=3,
+        fin=97_600, n3=1, n2hs=10, n2ls=6250, n1hs=5, nc1=122,
+    )
+    hid = _FakeMiniHid(feature_get_replies=[feature, feature, feature])
+    mini = LbeMini(hid)
+    mini.nav_sample_sec = 0.05
+    raw = mini.get_status()
+    assert "nav_clock" not in raw.extras
+
+
 def test_set_outputs_enable_sends_0x03():
     hid = _FakeMiniHid()
     mini = LbeMini(hid)

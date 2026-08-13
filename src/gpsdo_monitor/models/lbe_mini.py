@@ -33,11 +33,14 @@ from gpsdo_monitor.ubx import (
     CLS_MON,
     CLS_NAV,
     ID_MON_VER,
+    ID_NAV_CLOCK,
     ID_NAV_PVT,
     MonVer,
+    NavClock,
     decode_mini_hid_frame,
     iter_messages,
     parse_mon_ver,
+    parse_nav_clock,
     parse_nav_pvt,
 )
 
@@ -152,7 +155,7 @@ class LbeMini(GpsdoModel):
         except OSError as e:
             log.debug("Mini stream enable failed (harmless on first boot): %s", e)
 
-        pll_locked, gps_signal_ok, signal_loss, fix_type = self._sample_nav(
+        pll_locked, gps_signal_ok, signal_loss, fix_type, nav_clock = self._sample_nav(
             self.nav_sample_sec,
         )
 
@@ -178,32 +181,40 @@ class LbeMini(GpsdoModel):
             pps_enabled=False,
             drive_ma=drive_ma,
         )
+        extras: dict[str, object] = {}
+        if nav_clock is not None:
+            extras["nav_clock"] = nav_clock
         return RawStatus(
             health=health,
             outputs=outputs,
             firmware=None,
             firmware_source="unavailable",
             raw_trailing_hex=buf[16:].hex(" "),
+            extras=extras,
         )
 
     # --- Interrupt-IN stream sampler -----------------------------------
 
     def _sample_nav(
         self, duration_sec: float,
-    ) -> tuple[bool | None, bool | None, int | None, int | None]:
+    ) -> tuple[bool | None, bool | None, int | None, int | None, NavClock | None]:
         """Read interrupt-IN frames for up to `duration_sec` and return
-        `(pll_hw_locked, gps_signal_ok, signal_loss_count, fix_type)`.
+        `(pll_hw_locked, gps_signal_ok, signal_loss_count, fix_type,
+        nav_clock)`.
 
         Any return field is None when we never saw a frame that told us
         about it. Upstream treats "no frames at all" as "PLL locked"
         (defensive default); we return None so the caller can decide
         whether to fall back to a last-known value or mark the device
-        as degraded."""
+        as degraded. `nav_clock` is the newest UBX-NAV-CLOCK frame seen
+        in the window — bias/drift move constantly, so later frames
+        overwrite earlier ones."""
         deadline = time.monotonic() + duration_sec
         pll: bool | None = None
         gps: bool | None = None
         sig_loss: int | None = None
         fix: int | None = None
+        nav_clock: NavClock | None = None
         ubx_buf = b""
         while time.monotonic() < deadline:
             raw = self.hid.read(INTERRUPT_REPORT_SIZE, timeout_ms=50)
@@ -226,7 +237,11 @@ class LbeMini(GpsdoModel):
                     pvt = parse_nav_pvt(msg.payload)
                     if pvt is not None and fix is None:
                         fix = pvt.fix_type
-        return pll, gps, sig_loss, fix
+                if msg.class_id == CLS_NAV and msg.msg_id == ID_NAV_CLOCK:
+                    nc = parse_nav_clock(msg.payload)
+                    if nc is not None:
+                        nav_clock = nc   # newest wins; bias/drift move constantly
+        return pll, gps, sig_loss, fix, nav_clock
 
     # --- MON-VER -------------------------------------------------------
 
