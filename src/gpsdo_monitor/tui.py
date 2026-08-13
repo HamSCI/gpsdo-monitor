@@ -57,6 +57,7 @@ class _Row:
     out1: str           # frequency pretty-printed or "—"
     out2: str
     pps: str
+    clk: str
     error: str = ""
 
 
@@ -90,13 +91,13 @@ class GpsdoMonitorApp(App):
             table.add_columns(
                 "Model", "Serial", "A",
                 "PLL", "GPS", "Ant",
-                "Out1", "Out2", "PPS",
+                "Out1", "Out2", "PPS", "Clk",
                 "Note",
             )
             yield table
             yield Static(
                 "HID feature-report snapshot (no NMEA / PPS edges — "
-                "run `gpsdo-monitor status` for full detail).",
+                "run `gpsdo-monitor status` for full detail). Clk = u-blox self-reported bias/drift.",
                 id="footer-note",
             )
         yield Footer()
@@ -125,13 +126,13 @@ class GpsdoMonitorApp(App):
                 if self._serial_filter
                 else "No Leo Bodnar devices attached"
             )
-            table.add_row("—", "—", "—", "—", "—", "—", "—", "—", "—", note)
+            table.add_row("—", "—", "—", "—", "—", "—", "—", "—", "—", "—", note)
             return
         for r in rows:
             table.add_row(
                 r.model, r.serial, r.a_level,
                 r.pll, r.gps, r.ant,
-                r.out1, r.out2, r.pps,
+                r.out1, r.out2, r.pps, r.clk,
                 r.error,
             )
 
@@ -149,14 +150,14 @@ class GpsdoMonitorApp(App):
             return _Row(
                 model=candidate.model, serial=candidate.serial or "?",
                 a_level="—", pll="—", gps="—", ant="—",
-                out1="—", out2="—", pps="—",
+                out1="—", out2="—", pps="—", clk="—",
                 error=f"open failed: {e}",
             )
         except NotImplementedError as e:
             return _Row(
                 model=candidate.model, serial=candidate.serial or "?",
                 a_level="—", pll="—", gps="—", ant="—",
-                out1="—", out2="—", pps="—",
+                out1="—", out2="—", pps="—", clk="—",
                 error=str(e),
             )
         h = raw.health
@@ -175,6 +176,7 @@ class GpsdoMonitorApp(App):
             out1=_fmt_hz(o.out1_hz),
             out2=_fmt_hz(o.out2_hz),
             pps=_tick(o.pps_enabled) if o.pps_enabled is not None else "n/a",
+            clk=_fmt_nav_clock(raw.extras.get("nav_clock")),
         )
 
 
@@ -197,6 +199,15 @@ def _fmt_hz(hz: Optional[int]) -> str:
     if hz >= 1_000:
         return f"{hz / 1_000:g} kHz"
     return f"{hz} Hz"
+
+
+def _fmt_nav_clock(nc: object) -> str:
+    """Compact NAV-CLOCK cell: receiver clock bias and drift.
+
+    nc is a ubx.NavClock or None; drift in ns/s is numerically ppb."""
+    if nc is None:
+        return "—"
+    return f"{nc.clk_bias_ns}ns {nc.clk_drift_ns_s:+d}ppb"
 
 
 def _classify_a_level(
