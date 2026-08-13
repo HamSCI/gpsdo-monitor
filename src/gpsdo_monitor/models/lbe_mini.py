@@ -13,13 +13,9 @@ different from the 142x family:
 - OUT1 drive is discrete (8/16/24/32 mA) rather than a boolean
   high/low.
 
-Frequency planning (the Si5351 divider solver from upstream
-`mini_solve_pll`) is intentionally **not** ported here — it's a
-non-trivial search and we have no hardware to validate it against.
-`set_frequency` raises NotImplementedError until that happens, with a
-pointer to the upstream reference. `read_status` and
-`read_gps_firmware` are the two operations hf-timestd actually needs,
-and both are covered.
+Frequency planning (the Si5351 divider solver) is ported in pure Python
+(`gpsdo_monitor.mini_pll`, ported from David Goncalves' ringof/lbe-142x,
+MIT). `set_frequency` is supported and live-validated against a bench Mini.
 """
 from __future__ import annotations
 
@@ -27,6 +23,7 @@ import logging
 import time
 
 from gpsdo_monitor.hid_xport import REPORT_SIZE
+from gpsdo_monitor.mini_pll import solve_pll
 from gpsdo_monitor.models.base import Capabilities, GpsdoModel, RawStatus
 from gpsdo_monitor.schema import Health, Outputs
 from gpsdo_monitor.ubx import (
@@ -316,10 +313,31 @@ class LbeMini(GpsdoModel):
         self._send(OPC_BLINK, bytes([0x00]))
 
     def set_frequency(self, output: int, hz: int, *, persist: bool = True) -> None:
-        # The Si5351 divider-chain solver from upstream mini_solve_pll
-        # is non-trivial and not yet ported. Leave it explicit so nobody
-        # silently assumes it works.
-        raise NotImplementedError(
-            "LBE-Mini set_frequency requires the Si5351 divider solver; "
-            "see bvernoux/lbe-142x src/model_mini.c::mini_solve_pll"
-        )
+        """Program OUT1 via the divider solver (opcode 0x04, SET_PLL).
+
+        Payload layout per ringof/lbe-142x `mini_set_frequency` (MIT):
+        3-byte LE fields with upstream's minus-1 / minus-4 encodings,
+        NC2 mirroring NC1 on the single-output Mini, SKEW=0, BW=9.
+        The write persists in device flash; upstream has no temporary
+        variant on the Mini, so `persist=False` is rejected."""
+        if output != 1:
+            raise ValueError("LBE-Mini only has output 1")
+        if not persist:
+            raise ValueError("temporary frequency is not supported on the Mini")
+        if hz < 1 or hz > self.capabilities.max_freq_hz:
+            raise ValueError(f"frequency {hz} Hz out of range")
+        sol = solve_pll(hz)
+        if sol is None:
+            raise ValueError(f"no valid PLL divider chain for {hz} Hz")
+        p = bytearray(19)
+        p[0:3] = sol.fin.to_bytes(3, "little")
+        p[3:6] = (sol.n3 - 1).to_bytes(3, "little")
+        p[6] = sol.n2_hs - 4
+        p[7:10] = (sol.n2_ls - 1).to_bytes(3, "little")
+        p[10] = sol.n1_hs - 4
+        nc1_minus_1 = (sol.nc1_ls - 1).to_bytes(3, "little")
+        p[11:14] = nc1_minus_1
+        p[14:17] = nc1_minus_1
+        p[17] = 0   # SKEW
+        p[18] = 9   # BW
+        self._send(OPC_MINI_SET_PLL, bytes(p))

@@ -296,10 +296,51 @@ def test_set_power_level_rejects_output_2():
         mini.set_power_level(2, low=False)
 
 
-def test_set_frequency_is_explicitly_not_implemented():
+# --- set_frequency -------------------------------------------------------
+
+
+def test_set_frequency_packs_upstream_payload():
+    hid = _FakeMiniHid()
+    mini = LbeMini(hid)
+    mini.set_frequency(1, 10_000_000)
+    assert len(hid.feature_sets) == 1
+    report_id, buf = hid.feature_sets[0]
+    assert report_id == 0            # Mini uses no HID report ID
+    assert buf[0] == 0x04            # OPC_MINI_SET_PLL
+    # Solver result for 10 MHz (pinned by test_mini_pll.py):
+    # fin=97600, n3=1, n2_hs=10, n2_ls=6250, n1_hs=5, nc1_ls=122.
+    # Payload uses upstream's minus-1 / minus-4 offset encodings.
+    p = buf[1:20]
+    assert p[0:3] == (97_600).to_bytes(3, "little")       # fin
+    assert p[3:6] == (0).to_bytes(3, "little")            # N3-1
+    assert p[6] == 10 - 4                                 # N2_HS-4
+    assert p[7:10] == (6250 - 1).to_bytes(3, "little")    # N2_LS-1
+    assert p[10] == 5 - 4                                 # N1_HS-4
+    assert p[11:14] == (122 - 1).to_bytes(3, "little")    # NC1_LS-1
+    assert p[14:17] == (122 - 1).to_bytes(3, "little")    # NC2 mirrors NC1
+    assert p[17] == 0                                     # SKEW
+    assert p[18] == 9                                     # BW
+    assert all(b == 0 for b in buf[20:])                  # rest of report zeroed
+
+
+def test_set_frequency_rejects_bad_args():
     mini = LbeMini(_FakeMiniHid())
-    with pytest.raises(NotImplementedError, match="mini_solve_pll"):
-        mini.set_frequency(1, 10_000_000)
+    with pytest.raises(ValueError):
+        mini.set_frequency(2, 10_000_000)          # Mini has one output
+    with pytest.raises(ValueError):
+        mini.set_frequency(1, 0)                    # below range
+    with pytest.raises(ValueError):
+        mini.set_frequency(1, 900_000_000)          # above 810 MHz cap
+    with pytest.raises(ValueError):
+        mini.set_frequency(1, 10_000_000, persist=False)   # no temp-set on Mini
+
+
+def test_set_frequency_unsolvable_raises_with_frequency_in_message():
+    mini = LbeMini(_FakeMiniHid())
+    # 809,999,999 Hz is inside the Mini's range but has no divider
+    # chain — same value test_mini_pll.py pins as unsolvable.
+    with pytest.raises(ValueError, match="no valid PLL divider chain"):
+        mini.set_frequency(1, 809_999_999)
 
 
 def test_get_status_retains_newest_nav_clock():

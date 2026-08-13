@@ -62,10 +62,12 @@ against live hardware.
 | Drive strength (mA)| —        | —        | —        | 8/16/24/32 |
 | Max output         | 1.6 GHz  | 1.4 GHz  | 1.4 GHz  | 810 MHz  |
 
-`set_frequency` is implemented for the 142x family. On the Mini it
-requires the Si5351 divider-chain solver from upstream `mini_solve_pll`
-and is currently `NotImplementedError` until that's ported and live-
-validated.
+`set_frequency` is implemented for the whole family. The Mini path
+solves the Si-synth divider chain in pure Python
+(`gpsdo_monitor/mini_pll.py`, ported from David Goncalves'
+ringof/lbe-142x, MIT) and was live-validated against a bench Mini.
+Mini frequency writes always persist (the hardware has no
+temporary-set opcode).
 
 ## Install
 
