@@ -59,3 +59,46 @@ def test_index_round_trip(tmp_path):
     atomic_write(str(path), idx.to_json())
     parsed = json.loads(path.read_text())
     assert parsed["devices"][0]["serial"] == "A"
+
+
+def _make_minimal_report():
+    device = Device(
+        model="lbe-mini", pid="0x2443", serial="LBEMINI-XYZ",
+        hid_path="/dev/hidraw3",
+    )
+    health = Health(pll_locked=True, outputs_enabled=True)
+    outputs = Outputs()
+    pps = PpsStudy()
+    return new_report(
+        host="bee1.local", probe_interval_sec=10, device=device,
+        governs=["radiod:main"], health=health, outputs=outputs,
+        pps_study=pps, a_level_hint="A0", a_level_reason="minimal test report",
+    )
+
+
+def test_nav_clock_report_serializes_with_note():
+    from gpsdo_monitor.schema import NAV_CLOCK_NOTE, NavClockReport
+
+    nc = NavClockReport(
+        clk_bias_ns=-1234, clk_drift_ns_s=87,
+        t_acc_ns=25, f_acc_ps_s=310,
+        sampled_utc="2026-08-13T00:00:00.000Z",
+    )
+    assert nc.note == NAV_CLOCK_NOTE
+    assert "self-report" in nc.note
+
+
+def test_device_report_nav_clock_defaults_to_none_and_round_trips():
+    import json
+
+    from gpsdo_monitor.schema import NavClockReport
+
+    report = _make_minimal_report()          # see note below
+    assert report.nav_clock is None
+    report.nav_clock = NavClockReport(
+        clk_bias_ns=1, clk_drift_ns_s=2, t_acc_ns=3, f_acc_ps_s=4,
+        sampled_utc="2026-08-13T00:00:00.000Z",
+    )
+    parsed = json.loads(report.to_json())
+    assert parsed["nav_clock"]["clk_bias_ns"] == 1
+    assert "note" in parsed["nav_clock"]

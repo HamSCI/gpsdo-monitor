@@ -76,6 +76,26 @@ class PpsStudy:
     note: str = "OS-millisecond bound; not a metrology reference"
 
 
+NAV_CLOCK_NOTE = "u-blox receiver self-report; not an independent measurement"
+
+
+@dataclass
+class NavClockReport:
+    """UBX-NAV-CLOCK snapshot from the newest frame of the last probe.
+
+    Only devices with a UBX HID stream (LBE-Mini) produce this. The
+    note is fixed: these are the receiver's own estimates of its clock
+    state, not measurements against an external reference. Suggested by
+    David Goncalves (ringof/lbe-142x --clocklog)."""
+
+    clk_bias_ns: int
+    clk_drift_ns_s: int
+    t_acc_ns: int
+    f_acc_ps_s: int
+    sampled_utc: str
+    note: str = NAV_CLOCK_NOTE
+
+
 @dataclass
 class FirmwareAdvisory:
     status: str                          # "current" | "outdated" | "unknown"
@@ -97,6 +117,7 @@ class DeviceReport:
     a_level_hint: str                    # "A1" | "A0"
     a_level_reason: str
     firmware_advisory: FirmwareAdvisory | None = None
+    nav_clock: NavClockReport | None = None
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), indent=2, sort_keys=False)
@@ -150,6 +171,7 @@ def new_report(
     a_level_hint: str,
     a_level_reason: str,
     firmware_advisory: FirmwareAdvisory | None = None,
+    nav_clock: NavClockReport | None = None,
 ) -> DeviceReport:
     return DeviceReport(
         schema=SCHEMA_VERSION,
@@ -164,4 +186,5 @@ def new_report(
         a_level_hint=a_level_hint,
         a_level_reason=a_level_reason,
         firmware_advisory=firmware_advisory,
+        nav_clock=nav_clock,
     )

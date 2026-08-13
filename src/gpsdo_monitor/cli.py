@@ -72,6 +72,15 @@ def _cmd_status(args: argparse.Namespace) -> int:
         }
         if advisory is not None:
             out["firmware_advisory"] = advisory.__dict__
+        nc = raw.extras.get("nav_clock")
+        if nc is not None:
+            out["nav_clock"] = {
+                "clk_bias_ns": nc.clk_bias_ns,
+                "clk_drift_ns_s": nc.clk_drift_ns_s,
+                "t_acc_ns": nc.t_acc_ns,
+                "f_acc_ps_s": nc.f_acc_ps_s,
+                "note": "u-blox receiver self-report; not an independent measurement",
+            }
         print(json.dumps(out, indent=2))
     return 0
 

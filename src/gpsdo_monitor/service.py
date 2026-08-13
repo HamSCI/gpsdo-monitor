@@ -46,6 +46,7 @@ from gpsdo_monitor.schema import (
     FirmwareAdvisory,
     IndexEntry,
     IndexFile,
+    NavClockReport,
     PpsStudy,
     atomic_write,
     new_report,
@@ -174,6 +175,17 @@ class DeviceWorker:
         else:
             pps_study = PpsStudy(enabled=False, window_sec=60)
 
+        nav_clock = None
+        nc = raw.extras.get("nav_clock")
+        if nc is not None:
+            nav_clock = NavClockReport(
+                clk_bias_ns=nc.clk_bias_ns,
+                clk_drift_ns_s=nc.clk_drift_ns_s,
+                t_acc_ns=nc.t_acc_ns,
+                f_acc_ps_s=nc.f_acc_ps_s,
+                sampled_utc=utc_now_iso(),
+            )
+
         if self.firmware is not None:
             raw.firmware = self.firmware
             raw.firmware_source = self.firmware_source
@@ -209,6 +221,7 @@ class DeviceWorker:
             a_level_hint=a_level,
             a_level_reason=reason,
             firmware_advisory=self.firmware_advisory,
+            nav_clock=nav_clock,
         )
         self.last_report = report
         return report
