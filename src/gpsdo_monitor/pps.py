@@ -7,17 +7,31 @@ so precision is OS-scheduling bound (typically 1-10 ms).
 
 The canonical warning rides in every published report as
 `PpsStudy.note` — consumers must not treat these numbers as a timing
-source. hf-timestd uses these numbers only to decide A1/A0, never as a
-clock correction.
+source. hf-timestd uses the `pps_study` block only to decide A1/A0,
+never as a clock correction.
+
+This is the hardware path hf-timestd calls **T5**: the LBE-1421's 1PPS
+reaching the host over USB. It is deliberately the less accurate of the
+two PPS couplings — the BPSK-encoded PPS injected into the HF stream
+(T6) is sample-exact, whereas a DCD edge over CDC-ACM is quantised by
+USB interrupt polling and host scheduling before anything can timestamp
+it. hf-timestd's T5 pairing (`t5_rtp_pairing`) therefore consumes the
+NMEA-attested integer second (`health.pps_utc_sec`) from the same
+`/run/gpsdo/<serial>.json` and carries that latency budget in its
+`SIGMA_FLOOR_NS`; the edge timestamps captured here are not published
+per-edge, so a DCD-grounded T5 pairing would be a future change on both
+sides of the JSON contract.
 
 Two entry points:
 
   - `sample_pps(tty_path, duration_sec)` — one-shot sampler for the
     `gpsdo-monitor status` command. Polls TIOCMGET at 5 ms and counts
     rising edges; returns a `PpsStudy` populated with what it saw.
-  - `PpsTracker` — long-lived tracker for the daemon. Owns a thread
-    that blocks on `TIOCMIWAIT` for CPU-free edge capture, keeps a
-    rolling `window_sec`-second view. (Scaffold; daemon not yet wired.)
+  - `PpsTracker` — long-lived tracker for the daemon (`service.py`
+    starts one per 1421/1423 when `pps_study_enabled = true`). Owns a
+    thread that blocks on `TIOCMIWAIT` for CPU-free edge capture and
+    keeps a rolling `window_sec`-second view that `snapshot()` turns
+    into the published `pps_study` block.
 """
 from __future__ import annotations
 
