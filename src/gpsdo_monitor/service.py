@@ -37,7 +37,8 @@ from gpsdo_monitor.discovery import DiscoveryResult, match
 from gpsdo_monitor.health import classify
 from gpsdo_monitor.hid_xport import HidCandidate
 from gpsdo_monitor.models import open_model
-from gpsdo_monitor.nmea import NmeaReader, find_ttys_by_usb_serial
+from gpsdo_monitor.nmea import (NmeaReader, find_ttys_by_usb_serial,
+                                to_maidenhead)
 from gpsdo_monitor.pps import PpsTracker
 from gpsdo_monitor.publish import Advertiser
 from gpsdo_monitor.schema import (
@@ -154,17 +155,45 @@ class DeviceWorker:
                     self.firmware_advisory = lookup_protver(mv.protver)
 
         # NMEA enrichment: fresh snapshot for the tick.
+        #
+        # ⛔ Every line here belongs INSIDE the guard.  `altitude_m` sat one
+        # level out, so on any device without a tty it dereferenced an
+        # unbound `ns` and raised UnboundLocalError on EVERY tick.  The Mini
+        # presents no CDC serial at all, so gpsdo-monitor published nothing
+        # whatever on AC0G-ND from install onward — /run/gpsdo stayed empty
+        # while each failed probe reopened the device, re-binding hid-generic
+        # every 10 s.  B4 runs a 142x, which does present a tty, which is why
+        # this never showed in production.
         if self.nmea is not None:
             ns = self.nmea.snapshot()
-            raw.health.gps_fix = ns.gps_fix
-            raw.health.sats_used = ns.sats_used
             raw.health.fix_age_sec = ns.fix_age_sec(now=now)
             raw.health.pps_utc_sec = ns.pps_utc_sec
             raw.health.nmea_host_monotonic_at_read = ns.host_monotonic_at_read
-            raw.health.latitude = ns.latitude
-            raw.health.longitude = ns.longitude
-            raw.health.grid = ns.maidenhead()
-        raw.health.altitude_m = ns.altitude_m
+            # NMEA is the live, per-second view and wins where it HAS an
+            # answer — but it must not blank a value the model already read
+            # from UBX.  On a device with both, an NMEA snapshot taken
+            # between sentences would otherwise erase a good position.
+            if ns.gps_fix is not None:
+                raw.health.gps_fix = ns.gps_fix
+            if ns.sats_used is not None:
+                raw.health.sats_used = ns.sats_used
+            if ns.latitude is not None:
+                raw.health.latitude = ns.latitude
+            if ns.longitude is not None:
+                raw.health.longitude = ns.longitude
+            if ns.altitude_m is not None:
+                raw.health.altitude_m = ns.altitude_m
+            grid = ns.maidenhead()
+            if grid is not None:
+                raw.health.grid = grid
+
+        # The grid is what bring-up actually consumes to place the station,
+        # so derive it from whatever position arrived — NMEA or UBX.
+        if (raw.health.grid is None
+                and raw.health.latitude is not None
+                and raw.health.longitude is not None):
+            raw.health.grid = to_maidenhead(raw.health.latitude,
+                                            raw.health.longitude)
 
         # PPS study: snapshot the rolling window. If tracker isn't
         # running (no CDC, or device config disabled it) fall back to a

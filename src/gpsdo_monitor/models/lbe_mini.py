@@ -34,6 +34,7 @@ from gpsdo_monitor.ubx import (
     ID_NAV_PVT,
     MonVer,
     NavClock,
+    NavPvt,
     decode_mini_hid_frame,
     iter_messages,
     parse_mon_ver,
@@ -152,9 +153,8 @@ class LbeMini(GpsdoModel):
         except OSError as e:
             log.debug("Mini stream enable failed (harmless on first boot): %s", e)
 
-        pll_locked, gps_signal_ok, signal_loss, fix_type, nav_clock = self._sample_nav(
-            self.nav_sample_sec,
-        )
+        (pll_locked, gps_signal_ok, signal_loss, fix_type, nav_clock,
+         nav_pvt) = self._sample_nav(self.nav_sample_sec)
 
         gps_fix: str | None = None
         if fix_type is not None:
@@ -162,12 +162,35 @@ class LbeMini(GpsdoModel):
         elif gps_signal_ok is True:
             gps_fix = None   # we saw the signal-present bit but no NAV-PVT yet
 
+        # Position, from NAV-PVT and nowhere else: the Mini presents no CDC
+        # serial port, so the NMEA path that fills these fields on the 142x
+        # family does not exist here.
+        #
+        # ⛔ Only with an actual fix.  A receiver with no antenna still sends
+        # NAV-PVT, with fix_type 0 and lat/lon ZERO — and publishing 0,0
+        # would place the station in the Gulf of Guinea AND invite the
+        # location authority to re-grid a real station to it.  Absent
+        # position must read as unknown, which is what None means to every
+        # consumer here.
+        latitude = longitude = altitude_m = None
+        sats_used = None
+        if nav_pvt is not None:
+            sats_used = nav_pvt.num_sv
+            if nav_pvt.fix_type >= 2:
+                latitude = nav_pvt.lat_1e7 / 1e7
+                longitude = nav_pvt.lon_1e7 / 1e7
+                altitude_m = nav_pvt.hmsl_mm / 1000.0
+
         # The Mini has no antenna detector, no PPS on the status side,
         # no separate outputs_enabled bit beyond the feature-report byte.
         health = Health(
             pll_locked=bool(pll_locked) if pll_locked is not None else False,
             outputs_enabled=outputs_enabled,
             gps_fix=gps_fix,
+            sats_used=sats_used,
+            latitude=latitude,
+            longitude=longitude,
+            altitude_m=altitude_m,
             antenna_ok=None,
             signal_loss_count=signal_loss,
             gps_locked=gps_signal_ok,
@@ -194,10 +217,11 @@ class LbeMini(GpsdoModel):
 
     def _sample_nav(
         self, duration_sec: float,
-    ) -> tuple[bool | None, bool | None, int | None, int | None, NavClock | None]:
+    ) -> tuple[bool | None, bool | None, int | None, int | None,
+               NavClock | None, NavPvt | None]:
         """Read interrupt-IN frames for up to `duration_sec` and return
         `(pll_hw_locked, gps_signal_ok, signal_loss_count, fix_type,
-        nav_clock)`.
+        nav_clock, nav_pvt)`.
 
         Any return field is None when we never saw a frame that told us
         about it. Upstream treats "no frames at all" as "PLL locked"
@@ -212,6 +236,7 @@ class LbeMini(GpsdoModel):
         sig_loss: int | None = None
         fix: int | None = None
         nav_clock: NavClock | None = None
+        nav_pvt: NavPvt | None = None
         ubx_buf = b""
         while time.monotonic() < deadline:
             raw = self.hid.read(INTERRUPT_REPORT_SIZE, timeout_ms=50)
@@ -234,11 +259,17 @@ class LbeMini(GpsdoModel):
                     pvt = parse_nav_pvt(msg.payload)
                     if pvt is not None and fix is None:
                         fix = pvt.fix_type
+                        # Keep the whole solution.  NAV-PVT is the Mini's
+                        # ONLY position source — it presents no CDC serial,
+                        # so there is no NMEA behind it — and dropping
+                        # lat/lon/hMSL here left a Mini station unable to
+                        # derive its own grid (AC0G-ND 2026-09-02).
+                        nav_pvt = pvt
                 if msg.class_id == CLS_NAV and msg.msg_id == ID_NAV_CLOCK:
                     nc = parse_nav_clock(msg.payload)
                     if nc is not None:
                         nav_clock = nc   # newest wins; bias/drift move constantly
-        return pll, gps, sig_loss, fix, nav_clock
+        return pll, gps, sig_loss, fix, nav_clock, nav_pvt
 
     # --- MON-VER -------------------------------------------------------
 
