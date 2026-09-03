@@ -174,12 +174,27 @@ class LbeMini(GpsdoModel):
         # consumer here.
         latitude = longitude = altitude_m = None
         sats_used = None
+        fix_age_sec = None
         if nav_pvt is not None:
             sats_used = nav_pvt.num_sv
             if nav_pvt.fix_type >= 2:
                 latitude = nav_pvt.lat_1e7 / 1e7
                 longitude = nav_pvt.lon_1e7 / 1e7
                 altitude_m = nav_pvt.hmsl_mm / 1000.0
+                # The solution was decoded during THIS probe, so its age is
+                # ~0 by construction — the same reasoning build_report
+                # already applies to probe_age_sec, bounded by the sample
+                # window (nav_sample_sec).
+                #
+                # ⛔ Not cosmetic.  sigmond's location authority discards a
+                # fix whose age it cannot read ("if age is None or age > 120:
+                # continue"), and fix_age_sec used to be filled only from
+                # NMEA — which this device does not have.  So every fix the
+                # Mini ever produced was thrown away as stale, and AC0G-ND
+                # computed WWV path lengths from its grid-square CENTRE,
+                # 1.26 km from the real antenna: 4.2 us of path error
+                # against a T6 floor of 0.11 us.
+                fix_age_sec = 0.0
 
         # The Mini has no antenna detector, no PPS on the status side,
         # no separate outputs_enabled bit beyond the feature-report byte.
@@ -188,6 +203,7 @@ class LbeMini(GpsdoModel):
             outputs_enabled=outputs_enabled,
             gps_fix=gps_fix,
             sats_used=sats_used,
+            fix_age_sec=fix_age_sec,
             latitude=latitude,
             longitude=longitude,
             altitude_m=altitude_m,

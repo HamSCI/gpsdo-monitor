@@ -166,7 +166,9 @@ class DeviceWorker:
         # this never showed in production.
         if self.nmea is not None:
             ns = self.nmea.snapshot()
-            raw.health.fix_age_sec = ns.fix_age_sec(now=now)
+            _nmea_age = ns.fix_age_sec(now=now)
+            if _nmea_age is not None:
+                raw.health.fix_age_sec = _nmea_age
             raw.health.pps_utc_sec = ns.pps_utc_sec
             raw.health.nmea_host_monotonic_at_read = ns.host_monotonic_at_read
             # NMEA is the live, per-second view and wins where it HAS an

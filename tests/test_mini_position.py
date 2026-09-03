@@ -175,3 +175,47 @@ def test_a_fixless_nav_pvt_reports_no_position_rather_than_zeros():
     assert raw.health.latitude is None
     assert raw.health.longitude is None
     assert raw.health.altitude_m is None
+
+
+# --- 3 · the fix must also read as FRESH ---------------------------------
+
+
+def test_a_ubx_fix_reports_its_age_so_consumers_can_trust_it():
+    """⛔ sigmond's location authority rejects a fix with no age.
+
+    `sigmond-location-check` is the station's location authority — "a live
+    GPSDO position is DEFINITIVE" — and it gates on freshness::
+
+        age = h.get('fix_age_sec')
+        if age is None or age > 120:
+            continue          # -> NOGNSS
+
+    `fix_age_sec` was filled ONLY from NMEA (`ns.fix_age_sec(now=now)`), so on
+    a Mini it stayed None forever and the authority discarded every fix the
+    device ever produced.  On AC0G-ND that left hf-timestd computing WWV path
+    lengths from the CENTRE of grid EN16ov — 46.89583333, -96.79166667 —
+    while a 21-satellite fix read 46.9071213, -96.7926052.  1.26 km, which is
+    4.2 us of path error against a T6 floor of 0.11 us.
+
+    A NAV-PVT solution decoded during THIS probe is ~0 s old by construction,
+    the same reasoning `build_report` already applies to `probe_age_sec`.  So
+    the age is knowable and must be stated; None means "unknown", and a
+    consumer is right to distrust it.
+    """
+    raw = _mini_with(_nav_pvt_frames(
+        fix_type=3, num_sv=21,
+        lat_1e7=469071213, lon_1e7=-967926052, hmsl_mm=282428,
+    )).get_status()
+    assert raw.health.fix_age_sec is not None, \
+        'a fix with no stated age is discarded by the location authority'
+    assert raw.health.fix_age_sec == pytest.approx(0.0, abs=2.0)
+
+
+def test_a_fixless_receiver_states_no_age_either():
+    # Guards the guard: no fix must not masquerade as a FRESH fix, or the
+    # authority would re-grid a station to whatever lat/lon accompanied it.
+    raw = _mini_with(_nav_pvt_frames(
+        fix_type=0, num_sv=0, lat_1e7=0, lon_1e7=0, hmsl_mm=0,
+    )).get_status()
+    assert raw.health.fix_age_sec is None
+    assert raw.health.latitude is None
