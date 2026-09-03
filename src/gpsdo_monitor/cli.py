@@ -10,6 +10,7 @@ import argparse
 import json
 import logging
 import sys
+import time
 from pathlib import Path
 
 from gpsdo_monitor import __version__
@@ -184,6 +185,75 @@ def _cmd_tui(args: argparse.Namespace) -> int:
     return run_tui(serial=args.serial, refresh_sec=args.refresh_sec)
 
 
+def _cmd_set_drive(args: argparse.Namespace) -> int:
+    """Set OUT1 drive strength.
+
+    ⛔ AC0G-ND, 2026-09-03.  Its LBE-Mini sat at 8 mA — the floor of the Mini's
+    8/16/24/32 ladder — and at that level the GPSDO's 27 MHz did NOT take over
+    the RX888's reference.  The board ran on its own oscillator ~350 ppm fast,
+    hf-timestd's FUSE inherited the error, chrony followed FUSE and walked the
+    host clock twelve seconds off UTC, and the station decoded nothing for a day
+    while every health check read green.  Raising the drive to 32 mA brought
+    radiod's measured sample rate from +276..+400 ppm to +2..+50 ppm — locked.
+
+    The write path has existed per model since the driver was written and
+    nothing exposed it, so the remedy required driving the library by hand.
+    This is that remedy, made supported.
+
+    ⚠ The Mini's SET_DRIVE opcode documents no flash persistence (unlike
+    `set_frequency`), so re-check after any power cycle.
+    """
+    result = match(Config.from_file(Path(args.config) if args.config else None).devices)
+    for err in result.errors:
+        print(f"error: {err}", file=sys.stderr)
+    if not result.matched:
+        return 1
+    rc = 0
+    for _declared, candidate in result.matched:
+        if args.serial and candidate.serial != args.serial:
+            continue
+        # Retry the open: the Mini re-binds hid-generic every ~10 s on some
+        # hosts, so a single attempt loses the race.  And ALWAYS use the
+        # context manager — a handle left open makes every later open fail
+        # with "open failed", which is how this presents when it goes wrong.
+        last: Exception | None = None
+        for attempt in range(1, 6):
+            try:
+                with open_model(candidate) as model:
+                    if not model.capabilities.has_drive_ma:
+                        print(f"{candidate.model} {candidate.serial}: no drive-strength "
+                              f"control on this model", file=sys.stderr)
+                        rc = 2
+                        break
+                    before = model.get_status().outputs.drive_ma
+                    if before == args.milliamps:
+                        print(f"{candidate.model} {candidate.serial}: already "
+                              f"{args.milliamps} mA")
+                        break
+                    model.set_drive_ma(args.milliamps)
+                    time.sleep(1.5)
+                    after = model.get_status().outputs.drive_ma
+                    print(f"{candidate.model} {candidate.serial}: drive "
+                          f"{before} mA -> {after} mA")
+                    if after != args.milliamps:
+                        print(f"  ⚠ readback says {after} mA, wanted "
+                              f"{args.milliamps}", file=sys.stderr)
+                        rc = 1
+                break
+            except ValueError as e:
+                print(f"{candidate.model} {candidate.serial}: {e}", file=sys.stderr)
+                rc = 2
+                break
+            except OSError as e:
+                last = e
+                time.sleep(2.0)
+        else:
+            print(f"{candidate.model} {candidate.serial}: could not open after "
+                  f"5 attempts: {last}", file=sys.stderr)
+            rc = 1
+    return rc
+
+
 def _cmd_config(args: argparse.Namespace) -> int:
     # Placeholder — primary path is `smd gpsdo config`. Keeping this
     # stub so the parser documents the intended surface.
@@ -230,6 +300,22 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--refresh-sec", type=float, default=1.0,
                     help="refresh cadence in seconds (default 1.0)")
     sp.set_defaults(func=_cmd_tui)
+
+    sp = sub.add_parser(
+        "set-drive",
+        help="set OUT1 drive strength in mA (LBE-Mini: 8/16/24/32)",
+        description=(
+            "Set OUT1 drive strength.  A GPSDO whose drive is too low does not "
+            "take over the SDR's reference input: the board keeps running on its "
+            "own oscillator while the GPSDO reports itself locked and healthy.  "
+            "AC0G-ND lost a day of decodes to exactly that at 8 mA, the Mini's "
+            "floor.  Verify with radiod's \"measured sample rate\", which "
+            "scatters within ~20 ppm of nominal once the front end is governed."),
+    )
+    sp.add_argument("milliamps", type=int,
+                    help="drive strength (LBE-Mini accepts 8, 16, 24 or 32)")
+    sp.add_argument("--serial", help="restrict to one device by serial")
+    sp.set_defaults(func=_cmd_set_drive)
 
     sp = sub.add_parser("config", help="configure a device (placeholder; use `smd gpsdo config`)")
     sp.set_defaults(func=_cmd_config)
