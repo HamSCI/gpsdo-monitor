@@ -10,6 +10,23 @@ run_dir            = "/run/gpsdo"
 pps_study_enabled  = true
 mdns_enabled       = true
 
+# OUT1 drive strength the daemon RESTORES on every device attach, on models that
+# have the control (the LBE-Mini's 8/16/24/32 ladder).  32 mA is the Mini's own
+# default, so this restores a default rather than imposing a preference; 0
+# disables the assertion.
+#
+# ⛔ Why it exists.  AC0G-ND's Mini sat at 8 mA, the floor, and at that level the
+# GPSDO's 27 MHz did NOT take over the RX888's reference: the board ran on its
+# own oscillator ~350 ppm fast, hf-timestd's FUSE inherited the error, and chrony
+# walked the host clock TWELVE SECONDS off UTC.  The station decoded nothing for
+# a day while the GPSDO reported pll_locked, 3D fix, 17 satellites and
+# out1_hz 27000000 throughout.
+#
+# On every ATTACH rather than once: the Mini's SET_DRIVE opcode documents no
+# flash persistence, so reasserting makes the persistence question moot — and
+# the WARNING it logs is the experiment that answers it.
+min_drive_ma       = 32
+
 # Case B — two GPSDOs on one host, each governing one radiod:
 # [[monitor.device]]
 # serial  = "LBE1421-ABC123"

@@ -94,6 +94,7 @@ class DeviceWorker:
 
     def start(self) -> None:
         self.started_mono = time.monotonic()
+        self._assert_drive()
         if not self.candidate.serial:
             log.warning("device at %s has no USB serial — NMEA/PPS skipped",
                         self.candidate.path)
@@ -120,6 +121,54 @@ class DeviceWorker:
             except OSError as e:
                 log.warning("PPS tracker on %s failed: %s", self.tty_path, e)
                 self.pps = None
+
+    def _assert_drive(self) -> None:
+        """Restore OUT1 drive strength on attach, if this model has the control.
+
+        ⛔ AC0G-ND, 2026-09-03.  Its LBE-Mini sat at 8 mA — the floor of the
+        Mini's 8/16/24/32 ladder — and at that level the GPSDO's 27 MHz did NOT
+        take over the RX888's reference.  The board ran on its own oscillator
+        ~350 ppm fast; hf-timestd's FUSE derives from those samples and
+        inherited the error; chrony followed FUSE and walked the host clock
+        TWELVE SECONDS off UTC.  Every RTP label drifted with it and the station
+        decoded nothing for a day, while the GPSDO reported pll_locked, 3D fix,
+        17 satellites and out1_hz 27000000 throughout.  Raising the drive to
+        32 mA took radiod's measured sample rate from +276..+400 ppm to a
+        ±20 ppm scatter — governed.
+
+        Run on every ATTACH, not once, and deliberately so: the Mini's
+        SET_DRIVE opcode documents no flash persistence (unlike `set_frequency`),
+        so we cannot know whether the value survives a power cycle.  Reasserting
+        makes the question moot — and the log line below is the experiment that
+        answers it, since a volatile device will announce a correction after
+        every power-up.
+
+        32 mA is the Mini's OWN default, so this restores a default rather than
+        imposing a preference.  `min_drive_ma = 0` disables it.
+        """
+        want = int(getattr(self.cfg, "min_drive_ma", 0) or 0)
+        if want <= 0:
+            return
+        try:
+            with open_model(self.candidate) as model:
+                if not getattr(model.capabilities, "has_drive_ma", False):
+                    return
+                have = model.get_status().outputs.drive_ma
+                if have is None or have >= want:
+                    return
+                model.set_drive_ma(want)
+                log.warning(
+                    "%s %s: OUT1 drive was %d mA, restored to %d mA. A drive "
+                    "too low does not take over the SDR's reference input: the "
+                    "board keeps running on its own oscillator while this GPSDO "
+                    "reports itself locked. If you see this after every power "
+                    "cycle, the setting is volatile and wants a durable fix.",
+                    self.candidate.model, self.candidate.serial, have, want)
+        except (OSError, ValueError) as e:
+            # Never let this stop the worker starting — monitoring a device we
+            # could not adjust is strictly better than not monitoring it.
+            log.warning("%s %s: could not assert OUT1 drive: %s",
+                        self.candidate.model, self.candidate.serial, e)
 
     def stop(self) -> None:
         if self.nmea is not None:

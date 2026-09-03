@@ -14,6 +14,11 @@ from pathlib import Path
 DEFAULT_CONFIG_PATH = Path("/etc/gpsdo-monitor/config.toml")
 DEFAULT_RUN_DIR     = Path("/run/gpsdo")
 DEFAULT_PROBE_SEC   = 10
+# Drive strength the daemon restores on any device that has the control.
+# 32 mA is the LBE-Mini's OWN default (the top of its 8/16/24/32 ladder), so
+# this restores a default rather than imposing a preference.  0 disables the
+# assertion entirely.  See DeviceWorker._assert_drive for why it exists.
+DEFAULT_MIN_DRIVE_MA = 32
 
 
 @dataclass(frozen=True)
@@ -34,6 +39,7 @@ class Config:
     run_dir: Path = DEFAULT_RUN_DIR
     pps_study_enabled: bool = True
     mdns_enabled: bool = True
+    min_drive_ma: int = DEFAULT_MIN_DRIVE_MA
     devices: list[DeclaredDevice] = field(default_factory=list)
 
     @classmethod
@@ -55,5 +61,6 @@ class Config:
             run_dir=Path(mon.get("run_dir", DEFAULT_RUN_DIR)),
             pps_study_enabled=bool(mon.get("pps_study_enabled", True)),
             mdns_enabled=bool(mon.get("mdns_enabled", True)),
+            min_drive_ma=int(mon.get("min_drive_ma", DEFAULT_MIN_DRIVE_MA)),
             devices=devices,
         )
