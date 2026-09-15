@@ -374,6 +374,8 @@ class Service:
         self.advertiser: Optional[Advertiser] = None
         self._workers: dict[str, DeviceWorker] = {}
         self._last_report_hint: dict[str, str] = {}
+        # Last discovery error set, so _tick can log transitions only.
+        self._last_errors: tuple[str, ...] = ()
         self._fast_nmea_thread: Optional[threading.Thread] = None
 
     # --- lifecycle -----------------------------------------------------
@@ -455,8 +457,20 @@ class Service:
 
     def _tick(self) -> None:
         result = match(self.cfg.devices)
-        for err in result.errors:
-            log.error("discovery: %s", err)
+        # Log discovery errors on CHANGE, not once per tick.  A decoder VM
+        # with no GPSDO passed through is the normal state of a fresh
+        # install — install.sh enables the unit unconditionally even though
+        # the catalog marks it hardware-gated — and this wrote
+        # "discovery: no Leo Bodnar devices found" at ERROR every 10 s,
+        # 8,640 times a day, into the journal and onto the console.
+        # What is worth recording is when the GPSDO went away and when it
+        # came back, not a constant assertion that it is absent.
+        if tuple(result.errors) != self._last_errors:
+            for err in result.errors:
+                log.error("discovery: %s", err)
+            if not result.errors and self._last_errors:
+                log.info("discovery: resolved")
+            self._last_errors = tuple(result.errors)
         self._sync_workers(result)
         reports = self._write_reports(result)
         self._write_index(result, reports)
