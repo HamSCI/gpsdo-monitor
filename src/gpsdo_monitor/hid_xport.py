@@ -12,7 +12,25 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-import hid  # from `hidapi` package on PyPI
+# The `hidapi` wheel ships two backends with the same API.  Prefer `hidraw`,
+# which talks to /dev/hidrawN through the kernel's own HID driver.  The
+# default `hid` module is libusb-backed, and libusb DETACHES the kernel
+# driver on every open and reattaches it on close -- so a service that opens
+# the device once per probe tick makes the kernel unbind and rebind
+# hid-generic at that cadence, logging a line each time.
+#
+# Measured on AI6VN (LBE-Mini 1dd2:2211), 2026-09-16: five opens through
+# `hid` produced five kernel rebinds; five through `hidraw` produced none,
+# and every open succeeded on both.  At the shipped 10 s probe interval that
+# was ~8,600 rebind lines a day on the decoder VM's console and journal.
+#
+# Falls back to `hid` where the hidraw backend is unavailable (a platform
+# without /dev/hidraw, or an older wheel), so this cannot make the service
+# fail to start -- it just loses the quiet.
+try:  # pragma: no cover - which backend is present is environmental
+    import hidraw as hid
+except ImportError:  # pragma: no cover
+    import hid  # from `hidapi` package on PyPI
 
 REPORT_SIZE = 60
 VID_LBE = 0x1DD2
