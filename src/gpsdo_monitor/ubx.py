@@ -18,6 +18,7 @@ range.
 """
 from __future__ import annotations
 
+import calendar
 from dataclasses import dataclass
 from typing import Iterator
 
@@ -113,6 +114,31 @@ class NavPvt:
     lat_1e7: int
     lon_1e7: int
     hmsl_mm: int
+    # Fraction of the second the h/m/s above belongs to, in ns, signed:
+    # u-blox reports the rounded second in `second` and the correction
+    # here, so the true instant is (h:m:s) + nano_ns.  Range roughly
+    # -1e9..+1e9.  Without it the timestamp carries a whole second of
+    # unknown fraction, which is useless for naming a second to +/-0.4 s
+    # once the reading has aged.
+    nano_ns: int = 0
+    # The receiver's OWN estimate of its time accuracy, ns (UBX tAcc).
+    # A self-report, not an independent measurement -- but it is the only
+    # honest sigma available for a device that emits no PPS, and it is far
+    # better than assuming one.
+    t_acc_ns: int | None = None
+
+    @property
+    def valid_time(self) -> bool:
+        """Whether the date/time fields carry a resolved UTC solution.
+
+        UBX bit 2 of `valid` (fullyResolved) is the one that matters: a
+        receiver can report a plausible-looking date before it has
+        resolved UTC, and naming a second off that would name the wrong
+        one.  Set from the `valid` byte at parse time.
+        """
+        return bool(self._valid & 0x04)
+
+    _valid: int = 0
 
     @property
     def gps_fix_str(self) -> str:
@@ -120,7 +146,13 @@ class NavPvt:
 
 
 def parse_nav_pvt(payload: bytes) -> NavPvt | None:
-    """Decode a UBX-NAV-PVT payload. Returns None on a short buffer."""
+    """Decode a UBX-NAV-PVT payload. Returns None on a short buffer.
+
+    Byte map per the u-blox protocol spec: iTOW 0-3, year 4-5, month 6,
+    day 7, hour 8, min 9, sec 10, valid 11, tAcc 12-15, nano 16-19,
+    fixType 20, flags 21-22, numSV 23, lon 24-27, lat 28-31, height
+    32-35, hMSL 36-39.
+    """
     if len(payload) < 92:
         return None
     return NavPvt(
@@ -130,12 +162,40 @@ def parse_nav_pvt(payload: bytes) -> NavPvt | None:
         hour=payload[8],
         minute=payload[9],
         second=payload[10],
+        _valid=payload[11],
+        t_acc_ns=int.from_bytes(payload[12:16], "little", signed=False),
+        nano_ns=int.from_bytes(payload[16:20], "little", signed=True),
         fix_type=payload[20],
         num_sv=payload[23],
         lon_1e7=int.from_bytes(payload[24:28], "little", signed=True),
         lat_1e7=int.from_bytes(payload[28:32], "little", signed=True),
         hmsl_mm=int.from_bytes(payload[36:40], "little", signed=True),
     )
+
+
+def nav_pvt_utc(pvt: NavPvt) -> float | None:
+    """POSIX seconds of the instant `pvt` describes, or None.
+
+    Returns None unless the receiver reports a fully-resolved UTC
+    solution with at least a 2D fix -- a device will emit a
+    plausible-looking date before UTC resolves, and naming a second off
+    that names the wrong one.
+
+    ⚠ This is a TIME-OF-DAY reading, not a PPS.  It says WHICH second it
+    is, to whatever `t_acc_ns` claims; it does not say where the second
+    boundary sits.  A consumer that needs a boundary needs a PPS, and a
+    device reporting this does not necessarily have one.
+    """
+    if pvt.fix_type < 2 or not pvt.valid_time:
+        return None
+    try:
+        base = calendar.timegm((
+            pvt.year, pvt.month, pvt.day,
+            pvt.hour, pvt.minute, pvt.second, 0, 0, 0,
+        ))
+    except (ValueError, OverflowError):
+        return None
+    return float(base) + pvt.nano_ns / 1e9
 
 
 @dataclass

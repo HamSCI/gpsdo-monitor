@@ -218,8 +218,18 @@ class DeviceWorker:
             _nmea_age = ns.fix_age_sec(now=now)
             if _nmea_age is not None:
                 raw.health.fix_age_sec = _nmea_age
-            raw.health.pps_utc_sec = ns.pps_utc_sec
-            raw.health.nmea_host_monotonic_at_read = ns.host_monotonic_at_read
+            # Same rule as the fields below, and for the same reason: a
+            # snapshot taken between sentences must not blank a second the
+            # model already named from UBX.  No device does both today --
+            # the Mini has no tty and the 142x fills this from RMC -- but
+            # the unconditional form was one `if` away from the position
+            # bug documented immediately below.
+            if ns.pps_utc_sec is not None:
+                raw.health.pps_utc_sec = ns.pps_utc_sec
+                raw.health.nmea_host_monotonic_at_read = (
+                    ns.host_monotonic_at_read)
+                raw.health.naming_source = getattr(
+                    ns, "naming_source", None) or "nmea-rmc"
             # NMEA is the live, per-second view and wins where it HAS an
             # answer — but it must not blank a value the model already read
             # from UBX.  On a device with both, an NMEA snapshot taken

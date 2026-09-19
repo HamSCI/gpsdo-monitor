@@ -59,6 +59,25 @@ class Health:
     # hf-timestd's T5 (LB-1421) disambig path — see project_t5_nmea_probe_race.
     pps_utc_sec: int | None = None
     nmea_host_monotonic_at_read: float | None = None
+    # Where the integer second above came from, and how well the device
+    # claims to know it.
+    #
+    #   "nmea-rmc"     an RMC-valid sentence, paired with the monotonic at
+    #                  which that sentence was read (LBE-142x).
+    #   "ubx-nav-pvt"  a UBX NAV-PVT solution with fullyResolved set, paired
+    #                  with the monotonic at which that integer second
+    #                  BEGAN, back-computed from NAV-PVT's `nano`.
+    #
+    # ⛔ Neither implies a PPS.  Naming a second and placing its boundary
+    # are different questions: the first needs +/-0.5 s, the second needs
+    # microseconds and a pulse.  An LBE-Mini answers the first and cannot
+    # answer the second at all.  A consumer that needs a boundary must look
+    # at `pps_study` for MEASURED edges, never at this field.
+    naming_source: str | None = None
+    # The receiver's own time-accuracy estimate (UBX tAcc), ns.  A
+    # self-report, not an independent measurement -- but the only honest
+    # sigma available from a device that emits no pulse.
+    naming_sigma_ns: int | None = None
 
 
 @dataclass

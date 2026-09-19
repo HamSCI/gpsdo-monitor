@@ -47,6 +47,7 @@ class NmeaState:
     # part of the NMEA time is intentionally discarded because it reflects
     # sentence-emission delay, not the PPS edge.
     pps_utc_sec: int | None = None
+    naming_source: str | None = None
     host_monotonic_at_read: float | None = None
 
     def fix_age_sec(self, *, now: float | None = None) -> float | None:
@@ -194,6 +195,7 @@ def feed(state: NmeaState, line: str, *, now: float | None = None) -> None:
                 yy = int(date_str[4:6])
                 dt = datetime(2000 + yy, mo, dd, hh, mm, ss, tzinfo=timezone.utc)
                 state.pps_utc_sec = int(dt.timestamp())
+                state.naming_source = "nmea-rmc"
                 state.host_monotonic_at_read = time.monotonic()
             except (ValueError, IndexError):
                 pass

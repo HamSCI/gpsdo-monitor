@@ -20,6 +20,7 @@ MIT). `set_frequency` is supported and live-validated against a bench Mini.
 from __future__ import annotations
 
 import logging
+import math
 import time
 
 from gpsdo_monitor.hid_xport import REPORT_SIZE
@@ -39,6 +40,7 @@ from gpsdo_monitor.ubx import (
     iter_messages,
     parse_mon_ver,
     parse_nav_clock,
+    nav_pvt_utc,
     parse_nav_pvt,
 )
 
@@ -154,7 +156,7 @@ class LbeMini(GpsdoModel):
             log.debug("Mini stream enable failed (harmless on first boot): %s", e)
 
         (pll_locked, gps_signal_ok, signal_loss, fix_type, nav_clock,
-         nav_pvt) = self._sample_nav(self.nav_sample_sec)
+         nav_pvt, nav_pvt_mono) = self._sample_nav(self.nav_sample_sec)
 
         gps_fix: str | None = None
         if fix_type is not None:
@@ -196,6 +198,41 @@ class LbeMini(GpsdoModel):
                 # against a T6 floor of 0.11 us.
                 fix_age_sec = 0.0
 
+        # --- Naming a second, on a device that cannot PLACE one --------
+        #
+        # ⛔ The Mini emits NO PPS.  Its synthesiser floor sits far above
+        # 1 Hz and `pps_enabled` reads false; nothing here places a second
+        # BOUNDARY.  But NAV-PVT already tells us WHICH second it is, and
+        # the two questions differ by four orders of magnitude:
+        # "which integer second?" needs +/-0.5 s, "where is the edge?"
+        # needs microseconds and a pulse.
+        #
+        # hf-timestd keeps them apart on its side: resolve_t5_capability
+        # lights T5 only on MEASURED pps_study edges, so filling this
+        # cannot promote a pulse-less device to a tier that needs a pulse
+        # (T6_ACCEPTANCE_CRITERIA / gpsdo_capability.attach_second_namer).
+        # Until now the field stayed null for the Mini and DASI-009.AI6VN
+        # published naming_unavailable while the answer sat on its USB bus.
+        #
+        # The pair is boundary-consistent: `pps_utc_sec` is the integer
+        # second, and the monotonic beside it is when THAT SECOND BEGAN,
+        # back-computed from NAV-PVT's `nano` correction.  Pairing the
+        # second with the decode instant instead would leave up to a full
+        # second of unknown fraction in it, and a consumer ageing the
+        # reading forward would round to the wrong second.
+        pps_utc_sec = None
+        naming_mono = None
+        naming_sigma_ns = None
+        if nav_pvt is not None and nav_pvt_mono is not None:
+            utc_exact = nav_pvt_utc(nav_pvt)
+            if utc_exact is not None:
+                pps_utc_sec = int(math.floor(utc_exact))
+                naming_mono = nav_pvt_mono - (utc_exact - pps_utc_sec)
+                # The receiver's own tAcc: a self-report, not an
+                # independent measurement, but the only honest sigma a
+                # pulse-less device can offer.  Far better than assuming.
+                naming_sigma_ns = nav_pvt.t_acc_ns
+
         # The Mini has no antenna detector, no PPS on the status side,
         # no separate outputs_enabled bit beyond the feature-report byte.
         health = Health(
@@ -210,6 +247,10 @@ class LbeMini(GpsdoModel):
             antenna_ok=None,
             signal_loss_count=signal_loss,
             gps_locked=gps_signal_ok,
+            pps_utc_sec=pps_utc_sec,
+            nmea_host_monotonic_at_read=naming_mono,
+            naming_source="ubx-nav-pvt" if pps_utc_sec is not None else None,
+            naming_sigma_ns=naming_sigma_ns,
         )
         outputs = Outputs(
             out1_hz=freq_hz,
@@ -234,10 +275,10 @@ class LbeMini(GpsdoModel):
     def _sample_nav(
         self, duration_sec: float,
     ) -> tuple[bool | None, bool | None, int | None, int | None,
-               NavClock | None, NavPvt | None]:
+               NavClock | None, NavPvt | None, float | None]:
         """Read interrupt-IN frames for up to `duration_sec` and return
         `(pll_hw_locked, gps_signal_ok, signal_loss_count, fix_type,
-        nav_clock, nav_pvt)`.
+        nav_clock, nav_pvt, nav_pvt_monotonic)`.
 
         Any return field is None when we never saw a frame that told us
         about it. Upstream treats "no frames at all" as "PLL locked"
@@ -253,6 +294,7 @@ class LbeMini(GpsdoModel):
         fix: int | None = None
         nav_clock: NavClock | None = None
         nav_pvt: NavPvt | None = None
+        nav_pvt_mono: float | None = None
         ubx_buf = b""
         while time.monotonic() < deadline:
             raw = self.hid.read(INTERRUPT_REPORT_SIZE, timeout_ms=50)
@@ -281,11 +323,18 @@ class LbeMini(GpsdoModel):
                         # lat/lon/hMSL here left a Mini station unable to
                         # derive its own grid (AC0G-ND 2026-09-02).
                         nav_pvt = pvt
+                        # Monotonic at the moment this solution was
+                        # decoded, NOT at the end of the sample window:
+                        # the window is nav_sample_sec long, so pairing
+                        # the reading with the window's end would age
+                        # the second by up to that much before anyone
+                        # consumed it.
+                        nav_pvt_mono = time.monotonic()
                 if msg.class_id == CLS_NAV and msg.msg_id == ID_NAV_CLOCK:
                     nc = parse_nav_clock(msg.payload)
                     if nc is not None:
                         nav_clock = nc   # newest wins; bias/drift move constantly
-        return pll, gps, sig_loss, fix, nav_clock, nav_pvt
+        return pll, gps, sig_loss, fix, nav_clock, nav_pvt, nav_pvt_mono
 
     # --- MON-VER -------------------------------------------------------
 
