@@ -412,11 +412,21 @@ class ChronyShmFeed:
         Never blocks the reader for long (a few attribute stores) and
         never raises out of here: `LbeMini._ingest` already wraps hook
         calls in try/except, but a segment that is None (feed disabled,
-        or not yet open()ed) must be a silent no-op, not a fault."""
-        if self._shm is None:
+        or not yet open()ed) must be a silent no-op, not a fault.
+
+        Round 2, item 7: `self._shm` is read exactly ONCE, into `shm`,
+        and that binding is used for both the None-check and the write.
+        Reading the attribute twice (once to check, once as the call
+        argument) leaves a TOCTOU window: `close()` clears `_shm` with
+        no lock (by design -- M2), so a close() landing between the two
+        reads could hand `write_nav_pvt` a `None` the check never saw,
+        turning a benign shutdown race into a manufactured write
+        failure."""
+        shm = self._shm
+        if shm is None:
             return
         try:
-            write_nav_pvt(self._shm, pvt, real)
+            write_nav_pvt(shm, pvt, real)
         except Exception as exc:
             self._log_write_failure(exc)
 

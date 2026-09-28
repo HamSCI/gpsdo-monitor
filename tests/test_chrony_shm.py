@@ -355,6 +355,42 @@ def test_close_clears_shm_before_shmdt(monkeypatch):
     assert fake.shm_was_none_at_detach is True
 
 
+# --- Round 2, item 7: on_nav_pvt binds self._shm ONCE -----------------------
+
+
+def test_on_nav_pvt_reads_shm_exactly_once(monkeypatch):
+    """`on_nav_pvt` must bind `self._shm` to a local ONCE and use that
+    same binding for both the None-check and the write call, not read
+    the attribute twice. Two reads leave a TOCTOU window: a concurrent
+    close() (M2's fast path, no lock) landing between them can hand
+    write_nav_pvt a None it didn't see at the None-check, turning a
+    benign shutdown race into a manufactured 'write failed' log entry.
+    Verified by counting accesses through a class-level property that
+    shadows the instance attribute -- correct code touches it exactly
+    once per call. Mutation target: re-reading self._shm for the write
+    call (instead of reusing the bound local) makes this fail."""
+    fake = _FakeOkLibc()
+    monkeypatch.setattr(chrony_shm, "_get_libc", lambda: fake)
+    feed = ChronyShmFeed(unit=3)
+    assert feed.open() is True
+    real_shm = feed._shm
+
+    access_count = [0]
+
+    def _get_shm(self):
+        access_count[0] += 1
+        return real_shm
+
+    monkeypatch.setattr(ChronyShmFeed, "_shm", property(_get_shm), raising=False)
+
+    feed.on_nav_pvt(_pvt(nano_ns=0), mono=0.0, real=1_700_000_100.0)
+
+    assert access_count[0] == 1, (
+        f"on_nav_pvt read self._shm {access_count[0]} times; it must bind "
+        f"it to a local once and reuse that binding")
+    assert real_shm.valid == 1
+
+
 class _FlagCapturingLibc(_FakeOkLibc):
     """Records the flags shmget() was called with, so the CREATE mode
     bits can be asserted directly."""
