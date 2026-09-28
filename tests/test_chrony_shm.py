@@ -323,6 +323,38 @@ def test_open_success_initializes_static_fields_and_writes_through(monkeypatch):
     assert feed.connected is False
 
 
+# --- M2: close() clears _shm BEFORE detaching -------------------------------
+
+
+def test_close_clears_shm_before_shmdt(monkeypatch):
+    """`close()` must set `_shm = None` before calling `shmdt()`, not
+    after. A concurrent `on_nav_pvt` call checks `self._shm is None` with
+    no lock (Task 2's design: the reader thread must never block on this),
+    so the segment has to read as "disabled" before it is actually
+    unmapped -- otherwise a write can land on an address `shmdt` is in the
+    middle of releasing. Mutation target: swapping the two lines in
+    `close()` makes this fail."""
+    feed_holder: list[ChronyShmFeed] = []
+
+    class _OrderCheckingLibc(_FakeOkLibc):
+        def __init__(self) -> None:
+            super().__init__()
+            self.shm_was_none_at_detach: bool | None = None
+
+        def shmdt(self, addr):
+            self.shm_was_none_at_detach = feed_holder[0]._shm is None
+            return super().shmdt(addr)
+
+    fake = _OrderCheckingLibc()
+    monkeypatch.setattr(chrony_shm, "_get_libc", lambda: fake)
+    feed = ChronyShmFeed(unit=3)
+    feed_holder.append(feed)
+    assert feed.open() is True
+    feed.close()
+    assert fake.detached is True
+    assert fake.shm_was_none_at_detach is True
+
+
 class _FlagCapturingLibc(_FakeOkLibc):
     """Records the flags shmget() was called with, so the CREATE mode
     bits can be asserted directly."""
@@ -574,6 +606,65 @@ def test_second_mini_worker_does_not_get_the_feed(monkeypatch, tmp_path):
     finally:
         wa.stop()
         wb.stop()
+
+
+# --- M1: on_nav_pvt logs a write failure on transition only ----------------
+
+
+def test_on_nav_pvt_logs_write_failure_once_then_throttles(monkeypatch, caplog):
+    """A wedged SHM write (e.g. a torn segment) must not log once per
+    NAV-PVT (~1 Hz). It logs once immediately, stays quiet for repeats of
+    the SAME exception type inside WRITE_FAIL_LOG_INTERVAL_SEC, logs again
+    once that interval has passed, and logs immediately for a NEW
+    exception type regardless of the interval. Mutation target: removing
+    the throttle (always logging) or removing the new-type escape (never
+    logging again) both make this fail."""
+    fake = _FakeOkLibc()
+    monkeypatch.setattr(chrony_shm, "_get_libc", lambda: fake)
+    feed = ChronyShmFeed(unit=3)
+    assert feed.open() is True
+
+    def _boom(shm, pvt, real):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(chrony_shm, "write_nav_pvt", _boom)
+
+    clock = [1000.0]
+    monkeypatch.setattr(chrony_shm.time, "monotonic", lambda: clock[0])
+
+    pvt = _pvt()
+    logger_name = "gpsdo_monitor.chrony_shm"
+    with caplog.at_level(logging.ERROR, logger=logger_name):
+        feed.on_nav_pvt(pvt, mono=0.0, real=0.0)
+        feed.on_nav_pvt(pvt, mono=0.0, real=0.0)
+        feed.on_nav_pvt(pvt, mono=0.0, real=0.0)
+    errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert len(errors) == 1, (
+        "repeated failures of the SAME kind must not log per NAV-PVT")
+
+    # Still inside the throttle window: stays quiet.
+    clock[0] += chrony_shm.WRITE_FAIL_LOG_INTERVAL_SEC / 2
+    with caplog.at_level(logging.ERROR, logger=logger_name):
+        feed.on_nav_pvt(pvt, mono=0.0, real=0.0)
+    errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert len(errors) == 1
+
+    # Past the throttle window: logs again.
+    clock[0] += chrony_shm.WRITE_FAIL_LOG_INTERVAL_SEC
+    with caplog.at_level(logging.ERROR, logger=logger_name):
+        feed.on_nav_pvt(pvt, mono=0.0, real=0.0)
+    errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert len(errors) == 2
+
+    # A NEW exception type logs immediately, even inside the window.
+    def _boom_different(shm, pvt, real):
+        raise ValueError("a different kind of failure")
+
+    monkeypatch.setattr(chrony_shm, "write_nav_pvt", _boom_different)
+    with caplog.at_level(logging.ERROR, logger=logger_name):
+        feed.on_nav_pvt(pvt, mono=0.0, real=0.0)
+    errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert len(errors) == 3
 
 
 def test_no_feed_configured_leaves_hook_unset(monkeypatch, tmp_path):

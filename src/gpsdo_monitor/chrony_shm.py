@@ -72,6 +72,7 @@ import errno
 import logging
 import math
 import os
+import time
 from typing import Optional
 
 from gpsdo_monitor.ubx import NavPvt
@@ -103,6 +104,14 @@ RESERVED_SHM_UNITS: dict[int, str] = {
     1: "hf-timestd FUSE (writer)",
     2: "hf-timestd HPPS (writer)",
 }
+
+# M1 (final review): a persisting SHM-write failure logs once
+# immediately, then at most this often while the SAME exception TYPE
+# keeps recurring. A new exception type always logs right away -- that
+# is new information, not a repeat. Without this, a wedged writer
+# failing on every NAV-PVT (~1 Hz) would flood the journal at that
+# rate; see ChronyShmFeed._log_write_failure.
+WRITE_FAIL_LOG_INTERVAL_SEC = 300.0
 
 
 class ShmTime(ctypes.Structure):
@@ -283,6 +292,10 @@ class ChronyShmFeed:
         self._addr: Optional[int] = None
         self._open_failed_logged = False
         self._claimed_by: Optional[str] = None
+        # M1: transition-only logging for on_nav_pvt write failures --
+        # see WRITE_FAIL_LOG_INTERVAL_SEC / _log_write_failure.
+        self._write_fail_last_type: Optional[type] = None
+        self._write_fail_last_log_mono: Optional[float] = None
 
     @property
     def claimed_by(self) -> Optional[str]:
@@ -373,6 +386,12 @@ class ChronyShmFeed:
         self._open_failed_logged = True
 
     def close(self) -> None:
+        # M2: clear _shm FIRST, before detaching. on_nav_pvt checks
+        # `self._shm is None` with no lock (the reader must never block
+        # on this), so the feed has to read as disabled before the
+        # segment is actually unmapped -- otherwise a write in flight can
+        # land on an address shmdt() is in the middle of releasing.
+        self._shm = None
         if self._addr is not None:
             try:
                 _get_libc().shmdt(self._addr)
@@ -380,7 +399,6 @@ class ChronyShmFeed:
                 log.debug("chrony SHM detach failed (unit=%d)", self.unit,
                          exc_info=True)
             self._addr = None
-        self._shm = None
 
     # --- the Task 1 hook -------------------------------------------------
 
@@ -399,5 +417,24 @@ class ChronyShmFeed:
             return
         try:
             write_nav_pvt(self._shm, pvt, real)
-        except Exception:
-            log.exception("chrony SHM write failed (unit=%d)", self.unit)
+        except Exception as exc:
+            self._log_write_failure(exc)
+
+    def _log_write_failure(self, exc: Exception) -> None:
+        """M1: log a SHM write failure on transition only -- once
+        immediately, then at most every WRITE_FAIL_LOG_INTERVAL_SEC
+        while the same exception TYPE keeps recurring, or immediately
+        again for a NEW type. Must be called from inside the `except`
+        block that caught `exc` (uses `log.exception`, which reads the
+        active exception via `sys.exc_info()`)."""
+        now = time.monotonic()
+        exc_type = type(exc)
+        is_new_type = exc_type is not self._write_fail_last_type
+        stale = (self._write_fail_last_log_mono is None
+                 or now - self._write_fail_last_log_mono
+                 >= WRITE_FAIL_LOG_INTERVAL_SEC)
+        if not (is_new_type or stale):
+            return
+        log.exception("chrony SHM write failed (unit=%d)", self.unit)
+        self._write_fail_last_type = exc_type
+        self._write_fail_last_log_mono = now
