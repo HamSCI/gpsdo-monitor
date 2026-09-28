@@ -15,4 +15,5 @@
 | [SCHEMA-v1.md](SCHEMA-v1.md) | contributor | runtime contracts: `/run/gpsdo/<serial>.json` + mDNS `_gpsdo._tcp` |
 | [TOPOLOGY.md](TOPOLOGY.md) | contributor | GPSDO↔radiod mapping and the `governs` propagation |
 | [REQUIREMENTS.md](REQUIREMENTS.md) | contributor | formal requirements, reconciled to code |
+| [MINI_TIMING_WITNESS.md](MINI_TIMING_WITNESS.md) | operator | turn on the Mini's chrony witness feed and read `refclocks.log` |
 | [superpowers/](superpowers/plans/2026-08-13-goncalves-improvements.md) | contributor | plans/specs |
