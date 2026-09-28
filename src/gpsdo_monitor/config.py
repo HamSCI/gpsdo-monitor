@@ -40,6 +40,12 @@ class Config:
     pps_study_enabled: bool = True
     mdns_enabled: bool = True
     min_drive_ma: int = DEFAULT_MIN_DRIVE_MA
+    # NTP SHM unit (0-3) to feed each LBE-Mini's NAV-PVT into as a chrony
+    # `refclock SHM <unit>` WITNESS -- None (default) means off. The
+    # refclock this feeds must always be configured `noselect`: it never
+    # steers chrony, only lets an operator compare it against the system
+    # clock. See gpsdo_monitor.chrony_shm.
+    chrony_shm_unit: int | None = None
     devices: list[DeclaredDevice] = field(default_factory=list)
 
     @classmethod
@@ -56,11 +62,14 @@ class Config:
             )
             for d in mon.get("device", [])
         ]
+        chrony_shm_unit = mon.get("chrony_shm_unit")
         return cls(
             probe_interval_sec=int(mon.get("probe_interval_sec", DEFAULT_PROBE_SEC)),
             run_dir=Path(mon.get("run_dir", DEFAULT_RUN_DIR)),
             pps_study_enabled=bool(mon.get("pps_study_enabled", True)),
             mdns_enabled=bool(mon.get("mdns_enabled", True)),
             min_drive_ma=int(mon.get("min_drive_ma", DEFAULT_MIN_DRIVE_MA)),
+            chrony_shm_unit=(int(chrony_shm_unit)
+                             if chrony_shm_unit is not None else None),
             devices=devices,
         )

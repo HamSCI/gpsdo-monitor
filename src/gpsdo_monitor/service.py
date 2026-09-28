@@ -37,6 +37,7 @@ from typing import Optional
 
 from gpsdo_monitor import SCHEMA_VERSION
 from gpsdo_monitor.advisories import lookup_protver
+from gpsdo_monitor.chrony_shm import ChronyShmFeed
 from gpsdo_monitor.config import Config, DeclaredDevice
 from gpsdo_monitor.discovery import DiscoveryResult, match
 from gpsdo_monitor.health import classify
@@ -104,6 +105,14 @@ class DeviceWorker:
     ubx_reader_unsupported: bool = False
     # Last open attempt failed; later failures log at debug, not warning.
     ubx_open_failed: bool = False
+    # Shared across every worker (set by Service.start() when
+    # cfg.chrony_shm_unit is configured); None when the feed is off.
+    # Only the first Mini to claim it gets wired -- see
+    # _start_ubx_reader.
+    chrony_feed: Optional[ChronyShmFeed] = None
+    # One log line, not one per tick, when a second Mini finds the feed
+    # already claimed.
+    _chrony_shm_extra_logged: bool = False
 
     # --- lifecycle ---------------------------------------------------
 
@@ -218,6 +227,27 @@ class DeviceWorker:
         self.ubx_open_failed = False
         model.start_reader()
         self.mini = model
+        self._wire_chrony_shm(model)
+
+    def _wire_chrony_shm(self, model: LbeMini) -> None:
+        """Attach the shared chrony SHM feed's hook to `model`, if this
+        worker is the one Mini allowed to feed it (Task 2 of the
+        mini-nav-pvt-latency plan: one unit, one writer).  A device that
+        loses the claim keeps monitoring normally -- it just never
+        publishes to that SHM segment."""
+        feed = self.chrony_feed
+        if feed is None:
+            return
+        key = self.candidate.serial or self.candidate.path.decode(errors="replace")
+        if feed.claim(key):
+            model.on_nav_pvt = feed.on_nav_pvt
+        elif not self._chrony_shm_extra_logged:
+            log.warning(
+                "%s %s: chrony SHM feed (unit %d) already claimed by %s; "
+                "this device's NAV-PVT will not be written to it",
+                self.candidate.model, self.candidate.serial,
+                feed.unit, feed.claimed_by)
+            self._chrony_shm_extra_logged = True
 
     def _wants_ubx_reader(self) -> bool:
         if self.ubx_reader_unsupported:
@@ -505,6 +535,11 @@ class Service:
         self.cfg = cfg
         self.stopping = threading.Event()
         self.advertiser: Optional[Advertiser] = None
+        # Task 2 (mini-nav-pvt-latency): one shared chrony SHM witness
+        # feed for the (at most one, per unit) Mini allowed to write it.
+        # None whenever cfg.chrony_shm_unit is unset -- the feed is off
+        # by default.
+        self.chrony_feed: Optional[ChronyShmFeed] = None
         self._workers: dict[str, DeviceWorker] = {}
         self._last_report_hint: dict[str, str] = {}
         # Last discovery error set, so _tick can log transitions only.
@@ -515,6 +550,10 @@ class Service:
 
     def start(self) -> None:
         self.cfg.run_dir.mkdir(parents=True, exist_ok=True)
+        if self.cfg.chrony_shm_unit is not None:
+            self.chrony_feed = ChronyShmFeed(self.cfg.chrony_shm_unit)
+            self.chrony_feed.open()   # logs + disables itself on failure;
+                                       # never raises (see ChronyShmFeed.open)
         if self.cfg.mdns_enabled:
             try:
                 self.advertiser = Advertiser()
@@ -544,6 +583,9 @@ class Service:
         if self.advertiser is not None:
             self.advertiser.close()
             self.advertiser = None
+        if self.chrony_feed is not None:
+            self.chrony_feed.close()
+            self.chrony_feed = None
 
     def _fast_nmea_loop(self) -> None:
         """Background thread that republishes per-device JSON every
@@ -640,7 +682,8 @@ class Service:
                 continue
             log.info("device %s %s appeared; starting worker",
                      candidate.model, key)
-            w = DeviceWorker(candidate=candidate, declared=declared, cfg=self.cfg)
+            w = DeviceWorker(candidate=candidate, declared=declared, cfg=self.cfg,
+                             chrony_feed=self.chrony_feed)
             w.start()
             self._workers[key] = w
 
