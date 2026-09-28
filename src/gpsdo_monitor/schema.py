@@ -156,6 +156,10 @@ class DeviceReport:
     firmware_advisory: FirmwareAdvisory | None = None
     nav_clock: NavClockReport | None = None
     receiver_config: ReceiverConfig | None = None
+    # LBE-Mini only: UBX-NAV-PVT messages decoded over the trailing 60 s,
+    # divided by 60 -- how often the device actually sends a solution.
+    # null on every other model, and until a full 60 s window has run.
+    nav_pvt_rate_hz: float | None = None
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), indent=2, sort_keys=False)
@@ -211,6 +215,7 @@ def new_report(
     firmware_advisory: FirmwareAdvisory | None = None,
     nav_clock: NavClockReport | None = None,
     receiver_config: ReceiverConfig | None = None,
+    nav_pvt_rate_hz: float | None = None,
 ) -> DeviceReport:
     return DeviceReport(
         schema=SCHEMA_VERSION,
@@ -227,4 +232,5 @@ def new_report(
         firmware_advisory=firmware_advisory,
         nav_clock=nav_clock,
         receiver_config=receiver_config,
+        nav_pvt_rate_hz=nav_pvt_rate_hz,
     )

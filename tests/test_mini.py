@@ -8,10 +8,15 @@ that's the part that would silently break without coverage.
 """
 from __future__ import annotations
 
+import threading
+import time
+
 import pytest
 
+from gpsdo_monitor.models import lbe_mini as lbe_mini_mod
 from gpsdo_monitor.models.lbe_mini import LbeMini, _parse_feature
-from gpsdo_monitor.ubx import CLS_MON, CLS_NAV, ID_MON_VER, ID_NAV_PVT, build_message
+from gpsdo_monitor.ubx import (CLS_MON, CLS_NAV, ID_MON_VER, ID_NAV_CLOCK,
+                               ID_NAV_PVT, build_message)
 
 
 class _FakeMiniHid:
@@ -344,8 +349,6 @@ def test_set_frequency_unsolvable_raises_with_frequency_in_message():
 
 
 def test_get_status_retains_newest_nav_clock():
-    from gpsdo_monitor.ubx import ID_NAV_CLOCK
-
     def nav_clock_msg(bias_ns: int) -> bytes:
         payload = (
             (0).to_bytes(4, "little")
@@ -402,3 +405,390 @@ def test_set_outputs_enable_sends_0x03():
     assert hid.feature_sets[-1][1][:2] == bytes([0x01, 0x03])
     mini.set_outputs_enable(False)
     assert hid.feature_sets[-1][1][:2] == bytes([0x01, 0x00])
+
+
+# --- Continuous reader (one thread per Mini owns the HID stream) ---------
+#
+# The daemon used to sample interrupt-IN for 3 s out of every 10 s tick, so
+# ~7 s of every 10 s of NAV-PVT/NAV-CLOCK went unread and the device JSON
+# refreshed only every 10 s.  The reader thread owns the stream instead, and
+# get_status() answers from its snapshot.
+
+def _resolved_pvt_payload(*, second: int = 45, nano: int = -250_000_000,
+                          fix: int = 3, sv: int = 12,
+                          t_acc: int = 25_000) -> bytes:
+    p = bytearray(92)
+    p[4:6] = (2026).to_bytes(2, "little")
+    p[6], p[7], p[8], p[9], p[10] = 9, 27, 22, 40, second
+    p[11] = 0x07                                   # date|time|fullyResolved
+    p[12:16] = t_acc.to_bytes(4, "little")
+    p[16:20] = nano.to_bytes(4, "little", signed=True)
+    p[20] = fix
+    p[23] = sv
+    p[24:28] = (-967926052).to_bytes(4, "little", signed=True)
+    p[28:32] = (469071213).to_bytes(4, "little", signed=True)
+    p[36:40] = (282428).to_bytes(4, "little", signed=True)
+    return bytes(p)
+
+
+def _nav_clock_payload(bias_ns: int) -> bytes:
+    return ((0).to_bytes(4, "little")
+            + bias_ns.to_bytes(4, "little", signed=True)
+            + (7).to_bytes(4, "little", signed=True)
+            + (25).to_bytes(4, "little")
+            + (300).to_bytes(4, "little"))
+
+
+def _frames_for(stream: bytes) -> list[bytes]:
+    frames = []
+    for off in range(0, len(stream), 62):
+        chunk = stream[off:off + 62].ljust(62, b"\x00")
+        frames.append(_make_mini_hid_frame(
+            signal_loss=3, pll_locked=True, gps_signal=True,
+            carries_ubx=True, payload=chunk))
+    return frames
+
+
+def _pvt_frames(**kw) -> list[bytes]:
+    return _frames_for(build_message(CLS_NAV, ID_NAV_PVT,
+                                     _resolved_pvt_payload(**kw)))
+
+
+class _StreamFakeHid:
+    """A threaded fake HID handle.
+
+    `read` blocks like the real 50 ms interrupt read (a short sleep with the
+    handle marked busy) and serves frames only after `release()`, so a test
+    can start the reader before any data exists.  Every entry point checks
+    and records whether another thread was inside the handle at the same
+    moment: `overlaps` counts two threads on the handle at once — the thing
+    the per-device lock exists to prevent."""
+
+    READ_SLEEP_S = 0.01
+
+    def __init__(self, feature: bytes, frames: list[bytes] | None = None) -> None:
+        self._feature = feature
+        self._frames = list(frames or [])
+        self._gate = threading.Event()
+        self._mu = threading.Lock()
+        self._inside: threading.Thread | None = None
+        self.overlaps = 0
+        self.reads = 0
+        self.feature_gets = 0
+        self.feature_sets: list[tuple[int, bytes]] = []
+        self.closed = False
+
+    def release(self, more: list[bytes] | None = None) -> None:
+        with self._mu:
+            if more:
+                self._frames.extend(more)
+        self._gate.set()
+
+    def _enter(self) -> None:
+        with self._mu:
+            if self._inside is not None and self._inside is not threading.current_thread():
+                self.overlaps += 1
+            self._inside = threading.current_thread()
+
+    def _leave(self) -> None:
+        with self._mu:
+            if self._inside is threading.current_thread():
+                self._inside = None
+
+    def feature_get(self, report_id: int, length: int = 60) -> bytes:
+        self._enter()
+        try:
+            self.feature_gets += 1
+            time.sleep(0.001)
+            return self._feature
+        finally:
+            self._leave()
+
+    def feature_set(self, report_id: int, payload: bytes) -> None:
+        self._enter()
+        try:
+            time.sleep(0.001)
+            self.feature_sets.append((report_id, bytes(payload)))
+        finally:
+            self._leave()
+
+    def read(self, length: int, timeout_ms: int | None = None) -> bytes:
+        self._enter()
+        try:
+            self.reads += 1
+            time.sleep(self.READ_SLEEP_S)
+            if not self._gate.is_set():
+                return b""
+            with self._mu:
+                if not self._frames:
+                    return b""
+                return self._frames.pop(0)[:length]
+        finally:
+            self._leave()
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def _feature() -> bytes:
+    return _make_feature_buf(enabled=True, drive_idx=3, fin=97_600, n3=1,
+                             n2hs=10, n2ls=6250, n1hs=5, nc1=122)
+
+
+class _Clock:
+    """Monotonic with a settable offset, so staleness and the rate window can
+    be tested without waiting a minute."""
+
+    def __init__(self) -> None:
+        self.offset = 0.0
+
+    def __call__(self) -> float:
+        return time.monotonic() + self.offset
+
+
+def _wait_for(pred, timeout: float = 3.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if pred():
+            return True
+        time.sleep(0.005)
+    return pred()
+
+
+def _mini_on(hid, clock: _Clock | None = None) -> LbeMini:
+    mini = LbeMini(hid)
+    if clock is not None:
+        mini._monotonic = clock
+    return mini
+
+
+def test_reader_snapshot_is_updated_by_fed_frames():
+    stream = (build_message(CLS_NAV, ID_NAV_PVT, _resolved_pvt_payload())
+              + build_message(CLS_NAV, ID_NAV_CLOCK, _nav_clock_payload(-321)))
+    hid = _StreamFakeHid(_feature(), _frames_for(stream))
+    mini = _mini_on(hid)
+    mini.start_reader()
+    try:
+        hid.release()
+        assert _wait_for(lambda: mini.nav_pvt_count() >= 1)
+        assert _wait_for(lambda: mini.get_status().extras.get("nav_clock") is not None)
+        raw = mini.get_status()
+    finally:
+        mini.stop_reader()
+    h = raw.health
+    assert h.gps_fix == "3D"
+    assert h.sats_used == 12
+    assert h.pll_locked is True
+    assert h.gps_locked is True
+    assert h.signal_loss_count == 3
+    assert h.latitude == pytest.approx(46.9071213, abs=1e-6)
+    assert h.pps_utc_sec is not None and h.pps_utc_sec % 60 == 44
+    assert h.naming_source == "ubx-nav-pvt"
+    assert h.naming_sigma_ns == 25_000
+    assert h.nmea_host_monotonic_at_read is not None
+    assert h.fix_age_sec is not None and 0.0 <= h.fix_age_sec < 3.0
+    assert raw.extras["nav_clock"].clk_bias_ns == -321
+    assert raw.outputs.drive_ma == 32
+
+
+def test_get_status_with_reader_returns_without_sampling():
+    # The default 3 s window stays in force; with the reader running it must
+    # not be used.
+    hid = _StreamFakeHid(_feature(), _pvt_frames())
+    mini = _mini_on(hid)
+    assert mini.nav_sample_sec == 3.0
+    mini.start_reader()
+    try:
+        hid.release()
+        assert _wait_for(lambda: mini.nav_pvt_count() >= 1)
+        t0 = time.monotonic()
+        raw = mini.get_status()
+        elapsed = time.monotonic() - t0
+    finally:
+        mini.stop_reader()
+    assert raw.health.gps_fix == "3D"
+    assert elapsed < 0.5, f"get_status blocked {elapsed:.2f} s with the reader running"
+
+
+def test_stale_snapshot_reads_like_an_empty_window():
+    clock = _Clock()
+    hid = _StreamFakeHid(_feature(), _pvt_frames())
+    mini = _mini_on(hid, clock)
+    mini.start_reader()
+    try:
+        hid.release()
+        assert _wait_for(lambda: mini.nav_pvt_count() >= 1)
+        assert mini.get_status().health.gps_fix == "3D"
+        clock.offset = 16.0          # > 15 s since the last frame
+        raw = mini.get_status()
+    finally:
+        mini.stop_reader()
+    h = raw.health
+    # Exactly the "window saw nothing" reading of the legacy sampler.
+    assert h.gps_fix is None
+    assert h.pll_locked is False
+    assert h.gps_locked is None
+    assert h.signal_loss_count is None
+    assert h.sats_used is None
+    assert h.fix_age_sec is None
+    assert h.latitude is None
+    assert h.pps_utc_sec is None
+    assert h.naming_source is None
+    assert "nav_clock" not in raw.extras
+
+
+def test_nav_pvt_rate_is_decodes_in_trailing_60s():
+    clock = _Clock()
+    hid = _StreamFakeHid(_feature())
+    mini = _mini_on(hid, clock)
+    mini.start_reader()
+    try:
+        # A window shorter than 60 s cannot state a rate over 60 s.
+        assert mini.nav_pvt_rate_hz() is None
+        clock.offset = 30.0
+        hid.release(_pvt_frames(second=1) + _pvt_frames(second=2)
+                    + _pvt_frames(second=3))
+        assert _wait_for(lambda: mini.nav_pvt_count() >= 3)
+        clock.offset = 61.0          # window full; decodes ~31 s old
+        assert mini.nav_pvt_rate_hz() == pytest.approx(3 / 60)
+        assert mini.get_status().extras["nav_pvt_rate_hz"] == pytest.approx(3 / 60)
+        clock.offset = 95.0          # decodes now ~65 s old: out of window
+        assert mini.nav_pvt_rate_hz() == 0.0
+    finally:
+        mini.stop_reader()
+
+
+def test_setters_never_share_the_handle_with_the_reader():
+    hid = _StreamFakeHid(_feature())
+    mini = _mini_on(hid)
+    mini.start_reader()
+    try:
+        hid.release()
+        assert _wait_for(lambda: hid.reads >= 3)
+        reads_before = hid.reads
+        for _ in range(30):
+            mini.set_drive_ma(32)
+            mini.set_frequency(1, 10_000_000)
+            time.sleep(0.01)
+        reads_during = hid.reads - reads_before
+    finally:
+        mini.stop_reader()
+    # The reader kept reading between the setters (it was neither starved
+    # nor stopped), so the two really did contend for the handle.
+    assert reads_during >= 5, f"only {reads_during} reads during the setters"
+    assert hid.overlaps == 0, f"{hid.overlaps} overlapping handle accesses"
+    drive_sets = [p for (_, p) in hid.feature_sets if p[0] == 0x03]
+    assert len(drive_sets) == 30
+
+
+def test_stop_reader_joins_the_thread():
+    hid = _StreamFakeHid(_feature())
+    mini = _mini_on(hid)
+    mini.start_reader()
+    t = mini._reader_thread
+    assert t is not None and t.is_alive()
+    mini.stop_reader()
+    assert not t.is_alive()
+    assert mini._reader_thread is None
+
+
+def test_reader_resends_stream_enable_every_30s():
+    clock = _Clock()
+    hid = _StreamFakeHid(_feature())
+    mini = _mini_on(hid, clock)
+
+    def enables() -> int:
+        return sum(1 for (_, p) in hid.feature_sets
+                   if p[0] == lbe_mini_mod.OPC_MINI_NAV_STREAM)
+
+    mini.start_reader()
+    try:
+        assert _wait_for(lambda: enables() == 1)
+        time.sleep(0.1)
+        assert enables() == 1, "no re-send inside 30 s"
+        clock.offset = 31.0
+        assert _wait_for(lambda: enables() == 2)
+    finally:
+        mini.stop_reader()
+
+
+def test_on_nav_pvt_hook_gets_the_decode_instant():
+    seen = []
+    hid = _StreamFakeHid(_feature(), _pvt_frames())
+    mini = _mini_on(hid)
+    mini.on_nav_pvt = lambda pvt, mono, real: seen.append((pvt, mono, real))
+    mini.start_reader()
+    try:
+        before_real = time.time()
+        hid.release()
+        assert _wait_for(lambda: len(seen) == 1)
+        raw = mini.get_status()
+    finally:
+        mini.stop_reader()
+    pvt, mono, real = seen[0]
+    assert pvt.fix_type == 3
+    assert before_real <= real <= time.time()
+    # The same instant the naming pair is built from: the boundary monotonic
+    # is the decode monotonic minus the fraction past the integer second.
+    from gpsdo_monitor.ubx import nav_pvt_utc
+    utc = nav_pvt_utc(pvt)
+    expect = mono - (utc - int(utc // 1))
+    assert raw.health.nmea_host_monotonic_at_read == pytest.approx(expect, abs=1e-9)
+
+
+def test_a_raising_hook_does_not_stop_the_reader():
+    hid = _StreamFakeHid(_feature(), _pvt_frames(second=1) + _pvt_frames(second=2))
+    mini = _mini_on(hid)
+
+    def boom(*_a):
+        raise RuntimeError("hook failed")
+    mini.on_nav_pvt = boom
+    mini.start_reader()
+    try:
+        hid.release()
+        assert _wait_for(lambda: mini.nav_pvt_count() >= 2)
+    finally:
+        mini.stop_reader()
+
+
+def test_read_mon_ver_through_the_running_reader():
+    def pad(s: str, n: int) -> bytes:
+        return s.encode("ascii").ljust(n, b"\x00")[:n]
+    resp = build_message(CLS_MON, ID_MON_VER,
+                         pad("ROM CORE 3.01 (107888)", 30) + pad("00080000", 10)
+                         + pad("PROTVER=18.00", 30))
+    hid = _StreamFakeHid(_feature())
+    mini = _mini_on(hid)
+    mini.start_reader()
+    try:
+        assert _wait_for(lambda: hid.reads >= 2)
+        threading.Timer(0.05, hid.release, args=(_frames_for(resp),)).start()
+        mv = mini.read_mon_ver(timeout_sec=2.0)
+    finally:
+        mini.stop_reader()
+    assert mv is not None and mv.protver == "18.00"
+
+
+def test_a_setter_is_not_starved_by_a_busy_stream():
+    # Every read returns a frame at once, so the reader never idles between
+    # reads.  A plain lock is not fair; without the reader yielding to a
+    # waiting setter, the setter can wait many reads for the handle.
+    keepalive = _make_mini_hid_frame(signal_loss=0, pll_locked=True,
+                                     gps_signal=True, carries_ubx=False,
+                                     payload=b"\xff" * 62)
+    hid = _StreamFakeHid(_feature(), [keepalive] * 100_000)
+    mini = _mini_on(hid)
+    mini.start_reader()
+    try:
+        hid.release()
+        assert _wait_for(lambda: hid.reads >= 3)
+        worst = 0.0
+        for _ in range(20):
+            t0 = time.monotonic()
+            mini.set_drive_ma(32)
+            worst = max(worst, time.monotonic() - t0)
+            time.sleep(0.002)
+    finally:
+        mini.stop_reader()
+    # One read holds the handle 10 ms in this fake; allow a few of them.
+    assert worst < 0.05, f"a setter waited {worst * 1000:.0f} ms for the handle"

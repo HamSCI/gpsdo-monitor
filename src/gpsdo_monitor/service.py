@@ -8,7 +8,10 @@ One `DeviceWorker` per matched device owns:
   - a `PpsTracker` thread on the CDC DCD line (1421/1423 only), which
     uses TIOCMIWAIT so idle CPU stays flat between edges;
   - a cache of the UBX-MON-VER firmware answer (Mini only), since that
-    poll takes seconds and never changes after the first success.
+    poll takes seconds and never changes after the first success;
+  - on the Mini, ONE long-lived HID handle whose reader thread owns the
+    interrupt-IN stream (see LbeMini.start_reader), so NAV-PVT and
+    NAV-CLOCK are read continuously rather than 3 s out of every 10 s.
 
 Each probe tick the `Service` calls `worker.build_report(host)`, which
 assembles a schema-v1 `DeviceReport` from the HID bitmap, the NMEA
@@ -21,11 +24,13 @@ mDNS advertisements are refreshed on every tick and withdrawn when
 """
 from __future__ import annotations
 
+import dataclasses
 import logging
 import signal
 import socket
 import threading
 import time
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -36,7 +41,8 @@ from gpsdo_monitor.config import Config, DeclaredDevice
 from gpsdo_monitor.discovery import DiscoveryResult, match
 from gpsdo_monitor.health import classify
 from gpsdo_monitor.hid_xport import HidCandidate
-from gpsdo_monitor.models import open_model
+from gpsdo_monitor.models import REGISTRY, open_model
+from gpsdo_monitor.models.lbe_mini import LbeMini
 from gpsdo_monitor.nmea import (NmeaReader, find_ttys_by_usb_serial,
                                 to_maidenhead)
 from gpsdo_monitor.pps import PpsTracker
@@ -89,12 +95,19 @@ class DeviceWorker:
     # NMEA-only republish path can overlay just the NMEA-derived Health
     # fields without re-polling HID (which is hundreds of ms per call).
     last_report: Optional[DeviceReport] = None
+    # LBE-Mini: the device's one long-lived model, whose reader thread owns
+    # the HID stream.  None on every other model, and on a Mini whose open
+    # failed (ticks then fall back to opening per probe, as before).
+    mini: Optional[LbeMini] = None
 
     # --- lifecycle ---------------------------------------------------
 
     def start(self) -> None:
         self.started_mono = time.monotonic()
         self._assert_drive()
+        # Before the tty lookup below: the Mini presents no tty, so the
+        # early returns there would skip it.
+        self._start_ubx_reader()
         if not self.candidate.serial:
             log.warning("device at %s has no USB serial — NMEA/PPS skipped",
                         self.candidate.path)
@@ -170,7 +183,33 @@ class DeviceWorker:
             log.warning("%s %s: could not assert OUT1 drive: %s",
                         self.candidate.model, self.candidate.serial, e)
 
+    def _start_ubx_reader(self) -> None:
+        """Open a Mini once and start its reader thread.
+
+        Runs after _assert_drive, which opens and closes its own handle, so
+        the two never hold the device at the same time."""
+        cls = REGISTRY.get(self.candidate.pid)
+        if cls is None or not cls.capabilities.has_ubx_hid:
+            return
+        try:
+            model = open_model(self.candidate)
+        except (OSError, ValueError) as e:
+            log.warning("%s %s: could not open for continuous read (%s); "
+                        "falling back to a sample per probe",
+                        self.candidate.model, self.candidate.serial, e)
+            return
+        if not isinstance(model, LbeMini):
+            close = getattr(model, "close", None)
+            if close is not None:
+                close()
+            return
+        model.start_reader()
+        self.mini = model
+
     def stop(self) -> None:
+        if self.mini is not None:
+            self.mini.close()      # stops and joins the reader first
+            self.mini = None
         if self.nmea is not None:
             self.nmea.stop()
             self.nmea = None
@@ -181,7 +220,11 @@ class DeviceWorker:
     # --- per-tick data --------------------------------------------------
 
     def build_report(self, *, host: str, now: float) -> DeviceReport:
-        with open_model(self.candidate) as model:
+        # A Mini with a running reader keeps its handle open; everything
+        # else opens per tick, as the one-shot CLI does.
+        opener = (nullcontext(self.mini) if self.mini is not None
+                  else open_model(self.candidate))
+        with opener as model:
             raw = model.get_status()
             # MON-VER is slow (several hundred ms) and the answer never
             # changes, so we try once and cache. Subsequent ticks reuse
@@ -203,6 +246,10 @@ class DeviceWorker:
                     self.firmware_source = "ubx-mon-ver"
                     self.firmware_advisory = lookup_protver(mv.protver)
 
+        return self._assemble(raw, host=host, now=now)
+
+    def _assemble(self, raw, *, host: str, now: float) -> DeviceReport:
+        """Turn one RawStatus into the published DeviceReport."""
         # NMEA enrichment: fresh snapshot for the tick.
         #
         # ⛔ Every line here belongs INSIDE the guard.  `altitude_m` sat one
@@ -319,9 +366,25 @@ class DeviceWorker:
             firmware_advisory=self.firmware_advisory,
             nav_clock=nav_clock,
             receiver_config=receiver_config,
+            nav_pvt_rate_hz=raw.extras.get("nav_pvt_rate_hz"),
         )
         self.last_report = report
         return report
+
+    def refresh_fast(self, *, now: float) -> Optional[DeviceReport]:
+        """The 1 Hz republish for this device, or None when it has none.
+
+        NMEA devices overlay NMEA on the last full report, exactly as
+        before.  A Mini rebuilds the report from its reader's snapshot,
+        reusing the feature report the last probe tick read: the stream
+        state comes from memory and nothing touches the HID handle.  Both
+        need one full report first (cold start returns None)."""
+        if self.nmea is not None:
+            return self.refresh_nmea_only(now=now)
+        if self.mini is None or self.last_report is None:
+            return None
+        raw = self.mini.get_status(reuse_feature=True)
+        return self._assemble(raw, host=self.last_report.host, now=now)
 
     def refresh_nmea_only(self, *, now: float) -> Optional[DeviceReport]:
         """Build a fresh report by overlaying current NMEA state on top
@@ -344,7 +407,6 @@ class DeviceWorker:
         """
         if self.last_report is None or self.nmea is None:
             return None
-        import dataclasses
         ns = self.nmea.snapshot()
         new_health = dataclasses.replace(
             self.last_report.health,
@@ -372,10 +434,10 @@ class DeviceWorker:
 
 
 class Service:
-    # Fast-publish cadence for NMEA-only republish.  1 Hz matches the
-    # LBE-1421 NMEA emission rate — the JSON file's pps_utc_sec will
-    # therefore be at most ~1 s stale, well inside hf-timestd's T6
-    # disambig ±0.5 s pairing guard.
+    # Fast-publish cadence.  1 Hz matches the LBE-1421 NMEA emission rate —
+    # the JSON file's pps_utc_sec will therefore be at most ~1 s stale, well
+    # inside hf-timestd's T6 disambig ±0.5 s pairing guard.  A Mini rides
+    # the same loop from its reader's snapshot.
     _FAST_NMEA_INTERVAL_S = 1.0
 
     def __init__(self, cfg: Config) -> None:
@@ -424,9 +486,9 @@ class Service:
 
     def _fast_nmea_loop(self) -> None:
         """Background thread that republishes per-device JSON every
-        :attr:`_FAST_NMEA_INTERVAL_S` with fresh NMEA fields overlaid
-        on the last full report.  Does not touch HID and does not
-        re-advertise mDNS.
+        :attr:`_FAST_NMEA_INTERVAL_S`: fresh NMEA fields overlaid on the
+        last full report, or a Mini's reader snapshot.  Does not touch HID
+        and does not re-advertise mDNS.
         """
         while not self.stopping.is_set():
             if self.stopping.wait(self._FAST_NMEA_INTERVAL_S):
@@ -436,9 +498,9 @@ class Service:
             # _sync_workers fires concurrently.
             for worker in list(self._workers.values()):
                 try:
-                    report = worker.refresh_nmea_only(now=now)
+                    report = worker.refresh_fast(now=now)
                 except Exception:
-                    log.exception("fast NMEA republish failed for %s",
+                    log.exception("fast republish failed for %s",
                                   self._key(worker.candidate))
                     continue
                 if report is not None:

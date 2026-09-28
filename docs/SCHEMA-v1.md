@@ -138,6 +138,19 @@ model. Raw byte values as the device reports them; decoding
 }
 ```
 
+### `nav_pvt_rate_hz`
+
+`number | null`. LBE-Mini only. The daemon counts the UBX-NAV-PVT
+messages its reader thread decodes over the trailing 60 s and divides by
+60, so the field states how often the device actually sends a solution.
+It stays `null` for the first 60 s after the reader starts, since a
+shorter window would under-read the rate. `null` on every other model
+and from the one-shot `status` command, which runs no reader.
+
+```jsonc
+"nav_pvt_rate_hz": 1.0
+```
+
 ## A-level mapping
 
 ```

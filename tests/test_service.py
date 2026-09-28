@@ -9,6 +9,7 @@ atomic_write of /run/gpsdo/<serial>.json, and the index file.
 from __future__ import annotations
 
 import json
+import threading
 import time
 from pathlib import Path
 from typing import Optional
@@ -347,3 +348,151 @@ def test_service_worker_lifecycle_tracks_discovery(locked_1421_service, monkeypa
         assert svc._workers == {}
     finally:
         svc.stop()
+
+
+# --- LBE-Mini: one reader thread per device, 1 Hz republish ---------------
+
+
+def _mini_candidate(serial: str = "9DC7A55644") -> HidCandidate:
+    return HidCandidate(
+        path=b"/dev/hidraw-fake", vid=0x1DD2, pid=0x2211, serial=serial,
+        product="mini GPS Reference Clock",
+        manufacturer="Leo Bodnar Electronics",
+    )
+
+
+@pytest.fixture
+def mini_worker(monkeypatch, tmp_path):
+    """A DeviceWorker for a Mini whose HID is the threaded stream fake."""
+    from gpsdo_monitor import service as svc
+    from gpsdo_monitor.models.lbe_mini import LbeMini
+    from tests.test_mini import _StreamFakeHid, _feature, _pvt_frames
+
+    hid = _StreamFakeHid(_feature(), _pvt_frames())
+    opened: list[LbeMini] = []
+
+    def _open(_cand):
+        m = LbeMini(hid)
+        opened.append(m)
+        return m
+
+    monkeypatch.setattr(svc, "open_model", _open)
+    monkeypatch.setattr(svc, "find_ttys_by_usb_serial", lambda _s: [])
+    cand = _mini_candidate()
+    w = DeviceWorker(
+        candidate=cand,
+        declared=DeclaredDevice(serial=cand.serial, governs=("radiod:main",)),
+        cfg=Config(run_dir=tmp_path / "run", mdns_enabled=False,
+                   min_drive_ma=0, pps_study_enabled=False, devices=[]),
+    )
+    # MON-VER goes unanswered by this fake; skip the 5 s poll it would wait.
+    w.mon_ver_tried = True
+    w.hid = hid              # test handle
+    w.opened = opened        # test handle
+    return w
+
+
+def _wait(pred, timeout=3.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if pred():
+            return True
+        time.sleep(0.005)
+    return pred()
+
+
+def test_mini_worker_runs_one_reader_for_the_device(mini_worker):
+    w = mini_worker
+    w.start()
+    try:
+        assert w.mini is not None
+        t = w.mini._reader_thread
+        assert t is not None and t.is_alive()
+        w.hid.release()
+        assert _wait(lambda: w.mini.nav_pvt_count() >= 1)
+        # Ticks reuse the device's open handle: no per-tick open.
+        w.build_report(host="h", now=time.time())
+        w.build_report(host="h", now=time.time())
+        assert len(w.opened) == 1
+    finally:
+        w.stop()
+    assert not t.is_alive(), "stop() must join the reader"
+    assert w.mini is None
+    assert w.hid.closed
+
+
+def test_mini_report_carries_the_measured_nav_pvt_rate(mini_worker):
+    w = mini_worker
+    w.start()
+    try:
+        w.hid.release()
+        assert _wait(lambda: w.mini.nav_pvt_count() >= 1)
+        # Within the first minute there is no full window: null.
+        doc = json.loads(w.build_report(host="h", now=time.time()).to_json())
+        assert "nav_pvt_rate_hz" in doc and doc["nav_pvt_rate_hz"] is None
+        w.mini._reader_started_mono -= 61.0
+        doc = json.loads(w.build_report(host="h", now=time.time()).to_json())
+    finally:
+        w.stop()
+    assert doc["nav_pvt_rate_hz"] == pytest.approx(1 / 60)
+    # The existing contract is intact.
+    h = doc["health"]
+    assert h["naming_source"] == "ubx-nav-pvt"
+    assert h["pps_utc_sec"] is not None
+    assert h["nmea_host_monotonic_at_read"] is not None
+    assert h["fix_age_sec"] is not None
+    assert h["gps_fix"] == "3D"
+
+
+def test_mini_joins_the_fast_republish_without_touching_the_feature_report(mini_worker):
+    w = mini_worker
+    w.start()
+    try:
+        w.hid.release()
+        assert _wait(lambda: w.mini.nav_pvt_count() >= 1)
+        # Cold start: nothing to overlay yet.
+        assert w.refresh_fast(now=time.time()) is None
+        full = w.build_report(host="h", now=time.time())
+        gets_before = w.hid.feature_gets
+        fast = w.refresh_fast(now=time.time())
+        gets_after = w.hid.feature_gets
+    finally:
+        w.stop()
+    assert fast is not None
+    assert fast.health.pps_utc_sec == full.health.pps_utc_sec
+    assert fast.health.naming_source == "ubx-nav-pvt"
+    assert fast.outputs == full.outputs
+    assert gets_after == gets_before, "the 1 Hz path must not re-read the feature report"
+
+
+def test_fast_republish_is_unchanged_for_a_142x_without_nmea(tmp_path):
+    w = DeviceWorker(
+        candidate=_fake_candidate(), declared=DeclaredDevice(serial="TEST1421"),
+        cfg=Config(run_dir=tmp_path / "run", mdns_enabled=False, devices=[]),
+    )
+    assert w.refresh_fast(now=time.time()) is None
+
+
+def test_service_fast_loop_republishes_a_mini_every_second(mini_worker, tmp_path):
+    w = mini_worker
+    svc_ = Service(w.cfg)
+    svc_._FAST_NMEA_INTERVAL_S = 0.05
+    t = None
+    w.start()
+    try:
+        w.hid.release()
+        assert _wait(lambda: w.mini.nav_pvt_count() >= 1)
+        w.build_report(host="h", now=time.time())
+        svc_._workers["k"] = w
+        t = threading.Thread(target=svc_._fast_nmea_loop, daemon=True)
+        t.start()
+        path = w.cfg.run_dir / "9DC7A55644.json"
+        assert _wait(lambda: path.exists(), timeout=2.0)
+        first = json.loads(path.read_text())["written_utc"]
+        assert _wait(lambda: json.loads(path.read_text())["written_utc"] != first,
+                     timeout=2.0)
+    finally:
+        svc_.stopping.set()
+        if t is not None:
+            t.join(timeout=2.0)
+        w.stop()

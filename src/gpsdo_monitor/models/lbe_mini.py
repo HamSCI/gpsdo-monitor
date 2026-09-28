@@ -21,7 +21,12 @@ from __future__ import annotations
 
 import logging
 import math
+import threading
 import time
+from collections import deque
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from dataclasses import dataclass
 
 from gpsdo_monitor.hid_xport import REPORT_SIZE
 from gpsdo_monitor.mini_pll import solve_pll
@@ -57,6 +62,38 @@ OPC_MINI_UBX_WRAP  = 0x08
 OPC_MINI_NAV_STREAM = 0x0A
 
 INTERRUPT_REPORT_SIZE = 64       # interrupt-IN frame length
+
+# Continuous reader (see LbeMini.start_reader).
+READER_READ_TIMEOUT_MS = 50      # one interrupt-IN read; the lock is held this long at most
+STREAM_REFRESH_SEC = 30.0        # re-send the stream-enable bootstrap this often
+SNAPSHOT_STALE_SEC = 15.0        # older than this reads as "saw nothing"
+NAV_PVT_RATE_WINDOW_SEC = 60.0   # nav_pvt_rate_hz counts decodes over this window
+
+# Called by the reader on every decoded NAV-PVT with the host monotonic and
+# realtime clocks read at the same instant, right after the message finished
+# reassembling (the instant that also stamps the naming pair).
+NavPvtHook = Callable[[NavPvt, float, float], None]
+
+
+@dataclass
+class _NavSnapshot:
+    """What the reader thread last saw on the interrupt-IN stream.
+
+    Each value carries the monotonic at which it arrived, so get_status()
+    can refuse anything older than SNAPSHOT_STALE_SEC."""
+
+    last_frame_mono: float | None = None
+    pll: bool | None = None
+    gps: bool | None = None
+    sig_loss: int | None = None
+    nav_clock: NavClock | None = None
+    nav_clock_mono: float | None = None
+    nav_pvt: NavPvt | None = None
+    nav_pvt_mono: float | None = None
+    nav_pvt_real: float | None = None
+    nav_pvt_count: int = 0
+    mon_ver: MonVer | None = None
+    mon_ver_seq: int = 0
 
 
 def _parse_feature(buf: bytes) -> tuple[int, int, bool]:
@@ -102,6 +139,56 @@ class LbeMini(GpsdoModel):
     # callers / tests can tighten it.
     nav_sample_sec: float = 3.0
 
+    def __init__(self, hid) -> None:
+        super().__init__(hid)
+        # ONE lock guards every touch of the HID handle: interrupt reads,
+        # feature reads, and every feature command (stream enable, drive,
+        # PLL, outputs, blink, UBX polls).  Reentrant, so a command that
+        # sends several reports (the stream bootstrap) can hold it across
+        # the whole sequence.  The reader holds it only around one 50 ms
+        # read, so a setter waits at most about that long.
+        self._hid_lock = threading.RLock()
+        # Non-reader threads waiting for the handle.  The reader yields
+        # while this is non-zero: a plain Lock is not fair, and a loop that
+        # releases and re-acquires at once could starve a setter.
+        self._hid_waiters = 0
+        self._waiters_lock = threading.Lock()
+        # Latest-state snapshot the reader writes and get_status() reads.
+        self._state_cond = threading.Condition(threading.Lock())
+        self._snap = _NavSnapshot()
+        self._pvt_stamps: deque[float] = deque()
+        self._last_feature: bytes | None = None
+        self._reader_thread: threading.Thread | None = None
+        self._reader_stop = threading.Event()
+        self._reader_started_mono: float | None = None
+        # Clock seam: tests shift it to age the snapshot without waiting.
+        self._monotonic: Callable[[], float] = time.monotonic
+        # Hook point for the chrony SHM witness (plan Task 2).
+        self.on_nav_pvt: NavPvtHook | None = None
+
+    @contextmanager
+    def _hid_access(self) -> Iterator[None]:
+        """Hold the device's HID lock.  Every handle access goes through here."""
+        if threading.current_thread() is self._reader_thread:
+            with self._hid_lock:
+                yield
+            return
+        with self._waiters_lock:
+            self._hid_waiters += 1
+        acquired = False
+        try:
+            self._hid_lock.acquire()
+            acquired = True
+            with self._waiters_lock:
+                self._hid_waiters -= 1
+            yield
+        finally:
+            if acquired:
+                self._hid_lock.release()
+            else:
+                with self._waiters_lock:
+                    self._hid_waiters -= 1
+
     # UBX wrap command: opcode 0x08, payload = {class, id, len_lo, len_hi}.
     # The firmware prepends B5 62 and appends the Fletcher-8 checksum
     # itself, so we only hand it the four-byte header.
@@ -112,7 +199,8 @@ class LbeMini(GpsdoModel):
         buf[1:end] = args[: end - 1]
         # Mini uses no HID Report ID on the wire; hidapi's feature_set
         # still wants a report_id byte (0 for no-ID reports).
-        self.hid.feature_set(0, bytes(buf))
+        with self._hid_access():
+            self.hid.feature_set(0, bytes(buf))
 
     def _send_ubx_poll(self, class_id: int, msg_id: int) -> None:
         self._send(OPC_MINI_UBX_WRAP, bytes([class_id, msg_id, 0, 0]))
@@ -126,37 +214,76 @@ class LbeMini(GpsdoModel):
         sat_cfg   = bytes([0x06, 0x01, 0x08, 0x00, 0x01, 0x35, 0x14])
         clock_cfg = bytes([0x06, 0x01, 0x08, 0x00, 0x01, 0x22, 0x14])
         pvt_cfg   = bytes([0x06, 0x01, 0x08, 0x00, 0x01, 0x07, 0x0A])
-        self._send(OPC_MINI_NAV_STREAM, bytes([0x04]))
-        # Upstream drains two feature reads here to flush a stale state
-        # that otherwise produces ghost frames. Best-effort; ignore
-        # errors because hidapi will raise if the device has nothing
-        # queued yet, which is a normal state on a cold open.
-        for _ in range(2):
-            try:
-                self.hid.feature_get(0, REPORT_SIZE)
-            except OSError:
-                pass
-        self._send(OPC_MINI_UBX_WRAP, sat_cfg)
-        self._send(OPC_MINI_UBX_WRAP, clock_cfg)
-        self._send(OPC_MINI_UBX_WRAP, pvt_cfg)
+        # One lock hold across the whole sequence, so no other command can
+        # land between the refresh and the CFG-MSG frames.
+        with self._hid_access():
+            self._send(OPC_MINI_NAV_STREAM, bytes([0x04]))
+            # Upstream drains two feature reads here to flush a stale state
+            # that otherwise produces ghost frames. Best-effort; ignore
+            # errors because hidapi will raise if the device has nothing
+            # queued yet, which is a normal state on a cold open.
+            for _ in range(2):
+                try:
+                    self.hid.feature_get(0, REPORT_SIZE)
+                except OSError:
+                    pass
+            self._send(OPC_MINI_UBX_WRAP, sat_cfg)
+            self._send(OPC_MINI_UBX_WRAP, clock_cfg)
+            self._send(OPC_MINI_UBX_WRAP, pvt_cfg)
 
     # --- Read path -----------------------------------------------------
 
-    def get_status(self) -> RawStatus:
-        buf = self.hid.feature_get(0, REPORT_SIZE)
+    def get_status(self, *, reuse_feature: bool = False) -> RawStatus:
+        """Return the device state.
+
+        With the reader thread running (the daemon), everything the
+        interrupt-IN stream carries comes from its snapshot and this call
+        does not block on the stream.  Without it (one-shot CLI, TUI) the
+        call samples the stream for `nav_sample_sec`, as it always has.
+
+        `reuse_feature=True` answers from the last feature report read,
+        when there is one, instead of issuing a new control transfer.  The
+        1 Hz republish uses it: output settings change only when someone
+        sets them, and the 10 s probe tick re-reads them."""
+        buf = self._last_feature if reuse_feature else None
+        if buf is None:
+            with self._hid_access():
+                buf = self.hid.feature_get(0, REPORT_SIZE)
+            self._last_feature = buf
+
+        extras: dict[str, object] = {}
+        if self._reader_thread is not None:
+            (pll_locked, gps_signal_ok, signal_loss, fix_type, nav_clock,
+             nav_pvt, nav_pvt_mono) = self._snapshot_view()
+            # The snapshot can be up to SNAPSHOT_STALE_SEC old, so the fix
+            # states its real age rather than the sampler's ~0.
+            fix_age = (max(0.0, self._monotonic() - nav_pvt_mono)
+                       if nav_pvt_mono is not None else None)
+            extras["nav_pvt_rate_hz"] = self.nav_pvt_rate_hz()
+        else:
+            # Kick the stream bootstrap once per call so status works from
+            # a cold open. The Mini keeps its stream config across opens
+            # but the vendor tool still re-sends it — the reads/writes are
+            # cheap and idempotent.
+            try:
+                self._enable_stream()
+            except OSError as e:
+                log.debug("Mini stream enable failed (harmless on first boot): %s", e)
+            (pll_locked, gps_signal_ok, signal_loss, fix_type, nav_clock,
+             nav_pvt, nav_pvt_mono) = self._sample_nav(self.nav_sample_sec)
+            fix_age = 0.0
+        return self._build_status(
+            buf, pll_locked, gps_signal_ok, signal_loss, fix_type, nav_clock,
+            nav_pvt, nav_pvt_mono, fix_age, extras)
+
+    def _build_status(
+        self, buf: bytes, pll_locked: bool | None, gps_signal_ok: bool | None,
+        signal_loss: int | None, fix_type: int | None,
+        nav_clock: NavClock | None, nav_pvt: NavPvt | None,
+        nav_pvt_mono: float | None, fix_age: float | None,
+        extras: dict[str, object],
+    ) -> RawStatus:
         freq_hz, drive_ma, outputs_enabled = _parse_feature(buf)
-
-        # Kick the stream bootstrap once per call so status works from
-        # a cold open. The Mini keeps its stream config across opens
-        # but the vendor tool still re-sends it — the reads/writes are
-        # cheap and idempotent.
-        try:
-            self._enable_stream()
-        except OSError as e:
-            log.debug("Mini stream enable failed (harmless on first boot): %s", e)
-
-        (pll_locked, gps_signal_ok, signal_loss, fix_type, nav_clock,
-         nav_pvt, nav_pvt_mono) = self._sample_nav(self.nav_sample_sec)
 
         gps_fix: str | None = None
         if fix_type is not None:
@@ -196,7 +323,10 @@ class LbeMini(GpsdoModel):
                 # computed WWV path lengths from its grid-square CENTRE,
                 # 1.26 km from the real antenna: 4.2 us of path error
                 # against a T6 floor of 0.11 us.
-                fix_age_sec = 0.0
+                #
+                # With the reader running, the solution comes from its
+                # snapshot, and `fix_age` carries the time since decode.
+                fix_age_sec = fix_age
 
         # --- Naming a second, on a device that cannot PLACE one --------
         #
@@ -258,7 +388,6 @@ class LbeMini(GpsdoModel):
             pps_enabled=False,
             drive_ma=drive_ma,
         )
-        extras: dict[str, object] = {}
         if nav_clock is not None:
             extras["nav_clock"] = nav_clock
         return RawStatus(
@@ -297,7 +426,8 @@ class LbeMini(GpsdoModel):
         nav_pvt_mono: float | None = None
         ubx_buf = b""
         while time.monotonic() < deadline:
-            raw = self.hid.read(INTERRUPT_REPORT_SIZE, timeout_ms=50)
+            with self._hid_access():
+                raw = self.hid.read(INTERRUPT_REPORT_SIZE, timeout_ms=50)
             if not raw:
                 continue
             frame = decode_mini_hid_frame(raw)
@@ -336,6 +466,190 @@ class LbeMini(GpsdoModel):
                         nav_clock = nc   # newest wins; bias/drift move constantly
         return pll, gps, sig_loss, fix, nav_clock, nav_pvt, nav_pvt_mono
 
+    # --- Continuous reader (daemon) ------------------------------------
+    #
+    # One thread per Mini owns the interrupt-IN stream for the life of the
+    # device.  The 3 s window above ran once per 10 s probe tick, so ~7 s of
+    # every 10 s of NAV-PVT and NAV-CLOCK went unread and the JSON refreshed
+    # every 10 s.  The reader reads everything, keeps the newest state in a
+    # snapshot, and get_status() answers from it.
+
+    def start_reader(self) -> None:
+        """Start the reader thread (idempotent)."""
+        if self._reader_thread is not None:
+            return
+        self._reader_stop.clear()
+        self._reader_started_mono = self._monotonic()
+        t = threading.Thread(target=self._reader_loop,
+                             name="gpsdo-mini-reader", daemon=True)
+        self._reader_thread = t
+        t.start()
+
+    def stop_reader(self, *, timeout_sec: float = 2.0) -> None:
+        """Stop the reader thread and join it."""
+        t = self._reader_thread
+        if t is None:
+            return
+        self._reader_stop.set()
+        t.join(timeout=timeout_sec)
+        if t.is_alive():
+            log.warning("Mini reader did not stop within %.1f s", timeout_sec)
+        self._reader_thread = None
+        self._reader_started_mono = None
+
+    def close(self) -> None:
+        self.stop_reader()
+        super().close()
+
+    def nav_pvt_count(self) -> int:
+        """NAV-PVT messages the reader has decoded since it started."""
+        with self._state_cond:
+            return self._snap.nav_pvt_count
+
+    def nav_pvt_rate_hz(self) -> float | None:
+        """NAV-PVT decodes over the trailing 60 s, divided by 60.
+
+        The measured answer to "how often does the Mini actually send".
+        None until the reader has run a full window: a shorter one would
+        under-read the rate and look like a slow device."""
+        now = self._monotonic()
+        started = self._reader_started_mono
+        if started is None or now - started < NAV_PVT_RATE_WINDOW_SEC:
+            return None
+        cutoff = now - NAV_PVT_RATE_WINDOW_SEC
+        with self._state_cond:
+            n = sum(1 for m in self._pvt_stamps if m >= cutoff)
+        return n / NAV_PVT_RATE_WINDOW_SEC
+
+    def _snapshot_view(
+        self,
+    ) -> tuple[bool | None, bool | None, int | None, int | None,
+               NavClock | None, NavPvt | None, float | None]:
+        """The snapshot in `_sample_nav`'s return shape, minus anything stale.
+
+        No frame for SNAPSHOT_STALE_SEC reads exactly as a sample window
+        that saw nothing; a NAV-PVT or NAV-CLOCK that old reads as one the
+        window never saw."""
+        now = self._monotonic()
+
+        def fresh(mono: float | None) -> bool:
+            return mono is not None and now - mono <= SNAPSHOT_STALE_SEC
+
+        with self._state_cond:
+            s = self._snap
+            if not fresh(s.last_frame_mono):
+                return None, None, None, None, None, None, None
+            nav_clock = s.nav_clock if fresh(s.nav_clock_mono) else None
+            if fresh(s.nav_pvt_mono):
+                nav_pvt, nav_pvt_mono = s.nav_pvt, s.nav_pvt_mono
+            else:
+                nav_pvt, nav_pvt_mono = None, None
+            fix = nav_pvt.fix_type if nav_pvt is not None else None
+            return s.pll, s.gps, s.sig_loss, fix, nav_clock, nav_pvt, nav_pvt_mono
+
+    def _reader_loop(self) -> None:
+        ubx_buf = b""
+        next_enable = self._monotonic()     # enable at once, then every 30 s
+        failing = False
+        timeout_s = READER_READ_TIMEOUT_MS / 1000.0
+        while not self._reader_stop.is_set():
+            if self._monotonic() >= next_enable:
+                try:
+                    self._enable_stream()
+                except OSError as e:
+                    log.debug("Mini stream enable failed: %s", e)
+                next_enable = self._monotonic() + STREAM_REFRESH_SEC
+            # Let a waiting setter in before taking the handle again.
+            while self._hid_waiters and not self._reader_stop.is_set():
+                time.sleep(0.001)
+            t0 = time.monotonic()
+            try:
+                with self._hid_access():
+                    raw = self.hid.read(INTERRUPT_REPORT_SIZE,
+                                        timeout_ms=READER_READ_TIMEOUT_MS)
+            except OSError as e:
+                # Log the transition, not every failed read: a device gone
+                # for a minute would otherwise write 1,200 lines.
+                if not failing:
+                    log.warning("Mini interrupt read failing: %s", e)
+                    failing = True
+                ubx_buf = b""
+                self._reader_stop.wait(1.0)
+                continue
+            if failing:
+                log.info("Mini interrupt read recovered")
+                failing = False
+            if not raw:
+                # A read that returns empty well inside its timeout would
+                # otherwise spin this loop at full CPU.
+                spent = time.monotonic() - t0
+                if spent < timeout_s / 2:
+                    self._reader_stop.wait(timeout_s - spent)
+                continue
+            ubx_buf = self._ingest(raw, ubx_buf)
+
+    def _ingest(self, raw: bytes, ubx_buf: bytes) -> bytes:
+        """Fold one interrupt-IN frame into the snapshot; return the
+        unconsumed UBX tail."""
+        frame = decode_mini_hid_frame(raw)
+        if frame is None:
+            return ubx_buf
+        with self._state_cond:
+            s = self._snap
+            s.last_frame_mono = self._monotonic()
+            s.pll = frame.pll_hw_locked
+            s.gps = frame.gps_signal_ok
+            s.sig_loss = frame.signal_loss
+        if not frame.carries_ubx:
+            return ubx_buf
+        ubx_buf += frame.payload
+        msgs, consumed = iter_messages(ubx_buf)
+        if consumed:
+            ubx_buf = ubx_buf[consumed:]
+        # iter_messages keeps a partial tail; a tail longer than any legal
+        # message (8 + 512) can only be garbage.
+        if len(ubx_buf) > 1024:
+            ubx_buf = ubx_buf[-520:]
+        for msg in msgs:
+            if msg.class_id == CLS_NAV and msg.msg_id == ID_NAV_PVT:
+                pvt = parse_nav_pvt(msg.payload)
+                if pvt is None:
+                    continue
+                # The decode instant: the message has just finished
+                # reassembling.  Both clocks read here, together.
+                mono = self._monotonic()
+                real = time.time()
+                with self._state_cond:
+                    s = self._snap
+                    s.nav_pvt = pvt
+                    s.nav_pvt_mono = mono
+                    s.nav_pvt_real = real
+                    s.nav_pvt_count += 1
+                    self._pvt_stamps.append(mono)
+                    cutoff = mono - NAV_PVT_RATE_WINDOW_SEC
+                    while self._pvt_stamps and self._pvt_stamps[0] < cutoff:
+                        self._pvt_stamps.popleft()
+                hook = self.on_nav_pvt
+                if hook is not None:
+                    try:
+                        hook(pvt, mono, real)
+                    except Exception:
+                        log.exception("on_nav_pvt hook failed")
+            elif msg.class_id == CLS_NAV and msg.msg_id == ID_NAV_CLOCK:
+                nc = parse_nav_clock(msg.payload)
+                if nc is not None:
+                    with self._state_cond:
+                        self._snap.nav_clock = nc
+                        self._snap.nav_clock_mono = self._monotonic()
+            elif msg.class_id == CLS_MON and msg.msg_id == ID_MON_VER:
+                mv = parse_mon_ver(msg.payload)
+                if mv is not None:
+                    with self._state_cond:
+                        self._snap.mon_ver = mv
+                        self._snap.mon_ver_seq += 1
+                        self._state_cond.notify_all()
+        return ubx_buf
+
     # --- MON-VER -------------------------------------------------------
 
     def read_gps_firmware(self) -> str | None:
@@ -356,6 +670,8 @@ class LbeMini(GpsdoModel):
         timeout. Cold-start callers should run `_enable_stream()` first
         (get_status does that implicitly) so the module is willing to
         stream answers at all."""
+        if self._reader_thread is not None:
+            return self._read_mon_ver_via_reader(timeout_sec)
         try:
             self._send_ubx_poll(CLS_MON, ID_MON_VER)
         except OSError as e:
@@ -365,7 +681,8 @@ class LbeMini(GpsdoModel):
         deadline = time.monotonic() + timeout_sec
         ubx_buf = b""
         while time.monotonic() < deadline:
-            raw = self.hid.read(INTERRUPT_REPORT_SIZE, timeout_ms=50)
+            with self._hid_access():
+                raw = self.hid.read(INTERRUPT_REPORT_SIZE, timeout_ms=50)
             if not raw:
                 continue
             frame = decode_mini_hid_frame(raw)
@@ -379,6 +696,25 @@ class LbeMini(GpsdoModel):
                 if msg.class_id == CLS_MON and msg.msg_id == ID_MON_VER:
                     return parse_mon_ver(msg.payload)
         return None
+
+    def _read_mon_ver_via_reader(self, timeout_sec: float) -> MonVer | None:
+        """With the reader running it owns the stream: send the poll, then
+        wait for the reader to decode an answer newer than the poll."""
+        with self._state_cond:
+            seq0 = self._snap.mon_ver_seq
+        try:
+            self._send_ubx_poll(CLS_MON, ID_MON_VER)
+        except OSError as e:
+            log.warning("Mini MON-VER poll send failed: %s", e)
+            return None
+        deadline = time.monotonic() + timeout_sec
+        with self._state_cond:
+            while self._snap.mon_ver_seq == seq0:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return None
+                self._state_cond.wait(remaining)
+            return self._snap.mon_ver
 
     # --- Write path ----------------------------------------------------
 
