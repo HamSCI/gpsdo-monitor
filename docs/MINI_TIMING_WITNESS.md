@@ -26,18 +26,55 @@ would mean the opposite — the message beat the second it names, which normal
 USB/processing latency should never produce. Watch for it anyway; a positive
 offset would say the assumption above has a hole in it.
 
+A positive offset has a second, more mundane explanation, too: the host
+clock itself running ahead of true UTC by more than the latency. chrony
+measures MINI against whatever the system clock currently reads, not
+against true UTC — so if the host clock is fast enough, it can make an
+on-time (or even late) message look early. Check `chronyc tracking`'s
+`System time` line before reading a positive offset as a hole in the
+latency assumption; it may just be a fast host clock.
+
 ## Turn it on
 
 ### 1. Point gpsdo-monitor at chrony's unit 3
 
 Unit 3 is the fleet convention for this feed (`chrony_shm.RESERVED_SHM_UNITS`
 refuses units 0–2: gpsd, hf-timestd's FUSE writer, hf-timestd's HPPS writer).
-Add to `/etc/gpsdo-monitor/config.toml` (see `deploy/config.example.toml`):
+
+`/etc/gpsdo-monitor/config.toml` already has a `[monitor]` table on any
+station running this daemon (see `deploy/config.example.toml`) — with
+`probe_interval_sec`, `min_drive_ma`, maybe a `[[monitor.device]]` list,
+and so on. Add `chrony_shm_unit` as ONE MORE KEY inside that same
+`[monitor]` table, above any `[[monitor.device]]` header in the file (TOML
+reads everything between a table header and the next one as belonging to
+it, so a key placed after `[[monitor.device]]` would land in the wrong
+table). Do **not** write a second `[monitor]` block — TOML lets you, but
+`Config.from_file` only reads the first one it parses, so anything in a
+second block is silently ignored:
 
 ```toml
 [monitor]
-chrony_shm_unit = 3
+probe_interval_sec = 10
+min_drive_ma       = 32
+chrony_shm_unit    = 3        # <-- add this line, still inside [monitor]
+
+# [[monitor.device]]           # any existing device entries stay AFTER
+# serial = "..."
 ```
+
+Before restarting the daemon, confirm the key landed where `config.py`
+actually reads it (`raw.get("monitor", {}).get("chrony_shm_unit")`,
+`DEFAULT_CONFIG_PATH = /etc/gpsdo-monitor/config.toml` — check both
+against the installed `config.py` first if this doc and the code ever
+disagree):
+
+```
+python3 -c 'import tomllib;print(tomllib.load(open("/etc/gpsdo-monitor/config.toml","rb"))["monitor"].get("chrony_shm_unit"))'
+```
+
+This must print `3`. If it prints `None`, the key is outside `[monitor]`
+(most likely after a `[[monitor.device]]` header) or inside a second
+`[monitor]` block.
 
 Restart `gpsdo-monitor.service`. The daemon runs as `User=gpsdo`; if the SHM
 segment doesn't exist yet, it creates one world-writable (`0666`). If
@@ -98,9 +135,20 @@ sudo chronyd -p
 `-p` makes chronyd read its whole configuration — `chrony.conf` plus every
 file `confdir` pulls in, this drop-in included — print it in normalized
 form, and exit without touching whatever chronyd is already running
-(`chronyd.adoc`: "verify the syntax of the configuration"). A bad drop-in
-fails here, loudly, naming the bad line. That beats finding out when
-`systemctl restart chrony` fails instead.
+(`chronyd.adoc`: "verify the syntax of the configuration"). A bad
+top-level directive fails here, loudly, naming the bad line — the `perm`
+example in step 2 above is exactly this kind of failure, and `-p` catches
+it. That beats finding out when `systemctl restart chrony` fails instead.
+
+`-p` checks **directives** — the words chrony's own config parser
+recognizes, like the free-standing `perm 0666` mistake above. It does
+NOT check **driver options** — the part after the colon, like
+`:perm=0666` itself. Those aren't parsed until the refclock actually
+initializes, which happens on the real start `-p` skips. So `-p`
+passing is good evidence the drop-in parses; it is not proof the
+`:perm=0666` value will do what you expect once chronyd actually opens
+the segment. Confirm that after the restart instead, with `chronyc
+sources` / `chronyc sourcestats` in "Confirm it's running" below.
 
 ### 4. Add the log line, without breaking what's already logging
 
@@ -114,7 +162,65 @@ turns out to disagree, the safe alternative is editing that station's
 existing `log` line to add `refclocks` to it, rather than adding a second
 `log` line.
 
-### 5. Restart chrony
+### 5. Before you restart chronyd
+
+Restarting chronyd is not as quiet as it looks. On an hf-timestd station,
+chrony's systemd unit carries a drop-in
+(`hf-timestd/systemd/chronyd-timestd-shm.conf`, installed to
+`chrony.service.d/`) with `Wants=` on `timestd-metrology.target`,
+`timestd-l2-calibration.service`, `timestd-fusion.service`, and
+`timestd-core-recorder.service`. Restarting chrony starts any of those
+that are currently stopped — this restart is not just "reload chrony's
+config," it can also start hf-timestd services that were deliberately
+down.
+
+The restart also resets chrony's own NTP source selection: the `*`
+(selected) source can change while chrony re-picks one. hf-timestd's
+offset_judge tells T4 from T2 apart by whether the selected source sits
+on the LAN, so a restart can shift that classification until chrony
+reconverges (a few minutes, ordinarily). And if T6 is enabled,
+`timestd-hpps-watchdog` restarts `timestd-core-recorder` after HPPS goes
+quiet for a while (`HPPS_LASTRX_THRESHOLD_S`, currently 600 s in
+`timestd-hpps-watchdog.service` — check the live value on the station,
+it has changed before) — a chrony restart briefly removes the HPPS
+refclock, so it can count toward that.
+
+None of this touches the MINI refclock itself: chrony reads refclocks
+only from its config files, and this drop-in's effect survives a
+restart on its own. You are restarting chrony here only so the NEW
+`gpsdo-mini-witness.conf` drop-in takes effect — you do not need to
+restart chrony again just because `config.toml`'s `chrony_shm_unit`
+changed on the gpsdo-monitor side (restart `gpsdo-monitor.service` for
+that instead).
+
+Before restarting, record what the station looks like right now:
+
+```
+chronyc -n sources
+chronyc tracking
+systemctl is-active timestd-metrology.target timestd-l2-calibration.service \
+    timestd-fusion.service timestd-core-recorder.service timestd-hpps-watchdog.timer
+```
+
+Also check whether T6 is armed and whether gpsd is present — both change
+what the restart can disturb:
+
+```
+grep -A3 '^\[timing.t6_pps\]' /etc/hf-timestd/timestd-config.toml   # enabled = ?
+systemctl is-active gpsd
+```
+
+On a sigmond station, chrony restarts normally belong to the sigmond
+reconciler, not to an operator running `systemctl restart` by hand.
+**Announce the restart and get the operator's go before running it.**
+
+Repeat the same three commands after the restart, plus `chronyc sources`
+for MINI's own row once it appears. "Before/after" means: the same
+`chronyc -n sources` / `chronyc tracking` / `systemctl is-active` rows,
+now including MINI, and the same `*` (selected) source back in place
+after 5–10 minutes of reconvergence.
+
+### 6. Restart chrony
 
 ```
 systemctl restart chrony
