@@ -25,6 +25,14 @@ Fixtures under `tests/fixtures/`:
                                  `-` placeholder columns) per refclock,
                                  to prove filtered lines are excluded
                                  from the raw-sample statistics.
+  - refclocks_two_mini.log   -- exactly 2 MINI + 2 FUSE rows, for the
+                                 short-tau statistic's "only one
+                                 first-difference" edge case (I3).
+  - refclocks_good.log.1 +
+    refclocks_good_current.log -- refclocks_good.log's own 4+4 rows
+                                 split across two files at its ~58s
+                                 gap, as a real logrotate would, for
+                                 the multi-file merge (M4).
 
 Expected statistics below are computed independently with `statistics`
 module from the same raw floats the fixture encodes (column 8, "Cooked
@@ -39,6 +47,7 @@ import json
 import statistics
 import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -247,3 +256,152 @@ def test_edge_fixture_tighter_pair_gap_excludes_the_boundary_sample():
     diff = out["diff_mini_minus_fuse"]
     assert diff["unpaired_mini"] == 2
     assert diff["n"] == 2
+
+
+# --- I3: short-tau (two-sample / Allan-type) statistic ----------------------
+#
+# Implemented per the task brief: the standard deviation of first
+# differences between consecutive raw samples (gap <= --gap-threshold-sec),
+# divided by sqrt(2). For a white-noise process this equals the two-sample
+# (Allan) deviation at tau = one message period -- see
+# docs/MINI_TIMING_WITNESS.md and the module docstring in
+# mini_witness_summary.py for the formula and its citation.
+#
+# refclocks_good.log's MINI offsets (ms, file order): 1.234, 2.000, -0.500,
+# 3.000, at t = 0s, 16.01s, 32.005s, 90.0s. Consecutive gaps: 16.01s,
+# 15.995s, 57.995s. The last gap exceeds the default 40s
+# --gap-threshold-sec (it's the fixture's deliberate outage), so only the
+# first two first-differences are included.
+
+_MINI_TS = [
+    datetime(2026, 9, 28, 0, 0, 0, 0, tzinfo=timezone.utc),
+    datetime(2026, 9, 28, 0, 0, 16, 10000, tzinfo=timezone.utc),
+    datetime(2026, 9, 28, 0, 0, 32, 5000, tzinfo=timezone.utc),
+    datetime(2026, 9, 28, 0, 1, 30, 0, tzinfo=timezone.utc),
+]
+
+
+def _expected_short_tau(values_ms: list[float]) -> float:
+    diffs = [b - a for a, b in zip(values_ms, values_ms[1:])]
+    return statistics.stdev(diffs) / (2 ** 0.5)
+
+
+def test_good_fixture_mini_short_tau_statistic():
+    proc = _run("refclocks_good.log", "--json")
+    assert proc.returncode == 0, proc.stderr
+    out = json.loads(proc.stdout)
+
+    mini_ms = [v * 1000.0 for v in _MINI_OFFSETS_S]
+    expected_value = _expected_short_tau(mini_ms[:3])  # gap#3 excluded
+
+    st = out["mini_short_tau"]
+    assert st["n_diffs"] == 2
+    assert st["value_ms"] == pytest.approx(expected_value, abs=1e-9)
+
+
+def test_good_fixture_diff_short_tau_statistic():
+    proc = _run("refclocks_good.log", "--json")
+    assert proc.returncode == 0, proc.stderr
+    out = json.loads(proc.stdout)
+
+    diffs_ms = [(m - f) * 1000.0 for m, f in zip(_MINI_OFFSETS_S, _FUSE_OFFSETS_S)]
+    expected_value = _expected_short_tau(diffs_ms[:3])  # gap#3 excluded
+
+    st = out["diff_short_tau"]
+    assert st["n_diffs"] == 2
+    assert st["value_ms"] == pytest.approx(expected_value, abs=1e-9)
+
+
+def test_short_tau_with_only_one_diff_reports_none_but_counts_it():
+    # Two MINI samples 5s apart (well inside the gap threshold) give
+    # exactly ONE first-difference -- not enough to take a stdev of, so
+    # value_ms must be None even though n_diffs correctly reads 1.
+    proc = _run("refclocks_two_mini.log", "--json")
+    assert proc.returncode == 0, proc.stderr
+    out = json.loads(proc.stdout)
+    st = out["mini_short_tau"]
+    assert st["n_diffs"] == 1
+    assert st["value_ms"] is None
+
+
+def test_short_tau_reported_in_human_readable_output():
+    proc = _run("refclocks_good.log")
+    assert proc.returncode == 0, proc.stderr
+    assert "short-tau" in proc.stdout
+
+
+# --- I3: fold by the daemon's own schedule (10s tick / 30s stream refresh) -
+
+
+def _expected_fold(period_sec: int) -> dict:
+    bins: dict[int, list[float]] = {}
+    for ts, off_s in zip(_MINI_TS, _MINI_OFFSETS_S):
+        b = int(ts.timestamp()) % period_sec
+        bins.setdefault(b, []).append(off_s * 1000.0)
+    return {
+        str(b): {"n": len(v), "mean_ms": statistics.mean(v)}
+        for b, v in bins.items()
+    }
+
+
+@pytest.mark.parametrize("period,key", [(10, "mini_fold_10s"), (30, "mini_fold_30s")])
+def test_good_fixture_fold_by_schedule_period(period, key):
+    proc = _run("refclocks_good.log", "--json")
+    assert proc.returncode == 0, proc.stderr
+    out = json.loads(proc.stdout)
+
+    expected = _expected_fold(period)
+    got = out[key]
+    assert set(got.keys()) == set(expected.keys())
+    for b in expected:
+        assert got[b]["n"] == expected[b]["n"]
+        assert got[b]["mean_ms"] == pytest.approx(expected[b]["mean_ms"], abs=1e-9)
+
+
+# --- M4: multiple log files (e.g. a rotated file + the current one) --------
+#
+# refclocks_good.log.1 + refclocks_good_current.log together carry exactly
+# the same four MINI / four FUSE rows as refclocks_good.log, split at the
+# fixture's deliberate ~58s gap -- as a real rotation would.
+
+
+def _run_multi(*fixture_names: str, json_out: bool = True) -> subprocess.CompletedProcess:
+    args = [str(FIXTURES / name) for name in fixture_names]
+    if json_out:
+        args.append("--json")
+    return subprocess.run([str(SCRIPT), *args], capture_output=True, text=True, timeout=30)
+
+
+def test_multiple_logfiles_merge_to_the_same_stats_as_the_single_file():
+    single = _run("refclocks_good.log", "--json")
+    assert single.returncode == 0, single.stderr
+    expected = json.loads(single.stdout)
+
+    for order in (
+        ("refclocks_good.log.1", "refclocks_good_current.log"),
+        ("refclocks_good_current.log", "refclocks_good.log.1"),
+    ):
+        proc = _run_multi(*order)
+        assert proc.returncode == 0, proc.stderr
+        out = json.loads(proc.stdout)
+        assert out["mini"] == expected["mini"]
+        assert out["diff_mini_minus_fuse"] == expected["diff_mini_minus_fuse"]
+        assert out["mini_rate"]["n"] == expected["mini_rate"]["n"]
+        assert out["mini_gaps"] == expected["mini_gaps"]
+        assert out["mini_short_tau"] == expected["mini_short_tau"]
+        assert set(out["log_paths"]) == {str(FIXTURES / n) for n in order}
+
+
+def test_multiple_logfiles_human_readable_output_has_no_crash():
+    proc = _run_multi("refclocks_good.log.1", "refclocks_good_current.log", json_out=False)
+    assert proc.returncode == 0, proc.stderr
+    assert "MINI" in proc.stdout
+    assert "FUSE" in proc.stdout
+
+
+def test_single_logfile_still_works_positionally():
+    # Backward compatibility: one positional path, no change in behaviour.
+    proc = _run("refclocks_good.log", "--json")
+    assert proc.returncode == 0, proc.stderr
+    out = json.loads(proc.stdout)
+    assert out["log_paths"] == [str(FIXTURES / "refclocks_good.log")]

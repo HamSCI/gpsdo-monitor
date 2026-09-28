@@ -226,6 +226,15 @@ banner lines, and reports:
   filtered" above.
 - MINI − FUSE: the same four statistics over the paired differences, plus
   how many MINI samples had no FUSE sample close enough to pair with.
+- **Short-tau**: see the next section. This is the decision statistic for
+  "well under 1 ms and stable" — read it before the plain std above.
+- **Folded by schedule**: the mean MINI offset grouped by `(sample time)
+  mod 10 s` and `mod 30 s`, so a bucket that stands out flags an artifact
+  tied to gpsdo-monitor's own probe tick or stream refresh rather than
+  real Mini/host jitter. The full per-bucket table is in `--json` output
+  (`mini_fold_10s` / `mini_fold_30s`); the text report prints only the
+  spread across buckets, since a 30-bucket table doesn't read well on a
+  terminal.
 - Sample rate for each refclock (count and samples/hour over the span the
   log covers).
 - Gaps: any interval between consecutive raw samples on a refclock wider
@@ -240,11 +249,25 @@ sudo scripts/mini_witness_summary.sh
 sudo scripts/mini_witness_summary.sh /var/log/chrony/refclocks.log --json
 ```
 
+More than one log file merges by sample timestamp, so a rotated file and
+the current one — in either order — read as one continuous run:
+
+```
+sudo scripts/mini_witness_summary.sh /var/log/chrony/refclocks.log.1 \
+    /var/log/chrony/refclocks.log --json
+```
+
+Include the rotated file whenever the run you're measuring straddles a
+rotation — otherwise the samples on the older side of the cut are
+silently missing from the count, the rate, and the gap list.
+
 Flags: `--mini-refid`, `--fuse-refid` (default `MINI`/`FUSE`),
 `--max-pair-gap-sec` (default 8 s — a fixed cap comfortably inside one
 `poll 4` filter window, chosen to tolerate ordinary jitter between MINI's
 and FUSE's message arrivals without pairing across a real outage on
-either one), `--gap-threshold-sec` (default 40 s), `--json`.
+either one), `--gap-threshold-sec` (default 40 s — also the cutoff for
+which consecutive samples count as "one message period apart" for the
+short-tau statistic below), `--json`.
 
 If a line doesn't split into exactly 9 fields, or its first two fields
 don't parse as a UTC date and time, the script refuses to guess and exits
@@ -252,6 +275,42 @@ with a message naming the file and line — a changed chrony log format
 should stop the script, not feed it silently wrong numbers. The same
 refusal covers a `refclocks.log` with no rows for the refid it's looking
 for: report the miss, don't report zero.
+
+### The short-tau statistic: what actually answers "well under 1 ms"?
+
+Plain std (above) is measured over the whole run, so it also picks up
+anything that moves slowly over that span — chiefly the host clock's own
+NTP wander. It answers "how spread out were the samples," not "how much
+does one message's offset move from the next."
+
+The short-tau statistic answers that narrower question. For each pair of
+consecutive raw MINI samples no more than `--gap-threshold-sec` apart, take
+the difference between them. The **standard deviation of those
+differences, divided by √2**, is the value reported. For a white-noise
+process this equals the two-sample (Allan) deviation at τ = one message
+period — the standard formula from time-and-frequency metrology for "how
+much does this quantity change from one sample to the next" (see W.J.
+Riley, *Handbook of Frequency Stability Analysis*, NIST SP 1065). The
+script reports the same statistic for the MINI − FUSE differences too, when
+there are enough consecutive paired points.
+
+Three numbers, three different questions:
+
+- **Plain std** bounds the answer from above — it includes host NTP
+  wander over the whole run, so it can only overstate the Mini's own
+  jitter.
+- **MINI − FUSE std** also bounds it from above — FUSE carries its own
+  millisecond-level noise, so subtracting FUSE doesn't remove all
+  contamination.
+- **Short-tau** is the tightest read of the three, but even it cannot,
+  by itself, separate the Mini's real timing from gpsdo-monitor's own
+  stamp noise. The daemon reads the decode timestamp from Python, whose
+  GIL switches threads roughly every 5 ms; the 10 s probe tick and 30 s
+  stream-refresh both briefly hold the Mini's HID lock, queuing frames
+  behind them. A short-tau result of a few milliseconds is consistent
+  with a Mini that's tighter than that — it just can't prove it. Check
+  the folded-by-schedule numbers next: if the outliers line up with `mod
+  10 s` or `mod 30 s`, that's the daemon's own schedule, not the Mini.
 
 ## Caveats
 
@@ -262,5 +321,8 @@ for: report the miss, don't report zero.
 - `refclocks.log` grows without chrony ever rotating it. Whether a
   station's `logrotate` already covers `/var/log/chrony` hasn't been
   checked here — confirm before leaving `log refclocks` on for a long run.
+  If `logrotate` does rotate it mid-run, pass both the rotated file and
+  the current one to `mini_witness_summary.sh` (see above) so the run
+  reads as continuous instead of losing its older half.
 - Leave the refclock `noselect`. Nothing in this design has argued the Mini
   should ever steer the host clock; it exists to let an operator watch it.
