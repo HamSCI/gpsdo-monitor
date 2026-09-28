@@ -370,9 +370,19 @@ def mini_worker(monkeypatch, tmp_path):
 
     hid = _StreamFakeHid(_feature(), _pvt_frames())
     opened: list[LbeMini] = []
+    hids = [hid]
+    # Short error backoff so a reader gives up in tens of ms, not 3 s.
+    monkeypatch.setattr(LbeMini, "reader_error_backoff_sec", 0.01,
+                        raising=False)
 
     def _open(_cand):
-        m = LbeMini(hid)
+        # First open gets the fixture's handle; a reopen gets a fresh,
+        # live one, as a re-enumerated device would.
+        if opened:
+            h = _StreamFakeHid(_feature(), _pvt_frames())
+            h.release()
+            hids.append(h)
+        m = LbeMini(hids[-1])
         opened.append(m)
         return m
 
@@ -389,6 +399,7 @@ def mini_worker(monkeypatch, tmp_path):
     w.mon_ver_tried = True
     w.hid = hid              # test handle
     w.opened = opened        # test handle
+    w.hids = hids            # test handle
     return w
 
 
@@ -495,4 +506,136 @@ def test_service_fast_loop_republishes_a_mini_every_second(mini_worker, tmp_path
         svc_.stopping.set()
         if t is not None:
             t.join(timeout=2.0)
+        w.stop()
+
+
+# --- Fault handling (fix round 1) ----------------------------------------
+
+
+def test_a_failing_probe_closes_the_mini_and_the_next_tick_reopens(mini_worker):
+    w = mini_worker
+    w.start()
+    try:
+        w.hid.release()
+        assert _wait(lambda: w.mini.nav_pvt_count() >= 1)
+        w.build_report(host="h", now=time.time())
+        # The device dies: every access raises.
+        w.hid.broken_feature = True
+        w.hid.broken_read = True
+        with pytest.raises(OSError):
+            w.build_report(host="h", now=time.time())
+        assert w.mini is None, "a dead handle must be dropped"
+        assert w.hid.closed
+        # Next tick: the device is back (fresh handle) and gets reopened.
+        report = w.build_report(host="h", now=time.time())
+        assert len(w.opened) == 2
+        assert w.mini is not None and w.mini.hid is w.hids[-1]
+        assert w.mini._reader_thread is not None
+        assert report is not None
+    finally:
+        w.stop()
+
+
+def test_a_reader_that_gave_up_is_replaced_on_the_next_tick(mini_worker):
+    w = mini_worker
+    w.start()
+    try:
+        w.hid.release()
+        assert _wait(lambda: w.mini.nav_pvt_count() >= 1)
+        first = w.mini
+        w.hid.broken_read = True        # reads die; feature reads still work
+        assert _wait(lambda: first.reader_failed, timeout=2.0)
+        w.build_report(host="h", now=time.time())
+        assert w.hid.closed, "the dead handle must be closed"
+        assert w.mini is not first and len(w.opened) == 2
+    finally:
+        w.stop()
+
+
+def test_fast_republish_stops_once_the_probe_is_older_than_two_intervals(mini_worker):
+    w = mini_worker
+    w.cfg.probe_interval_sec = 1
+    w.start()
+    try:
+        w.hid.release()
+        assert _wait(lambda: w.mini.nav_pvt_count() >= 1)
+        w.build_report(host="h", now=time.time())
+        assert w.refresh_fast(now=time.time()) is not None
+        w.mini._last_feature_mono -= 2.5       # last good HID probe 2.5 s ago
+        assert w.refresh_fast(now=time.time()) is None, \
+            "a stale probe must stop the file refreshing, so its age shows"
+    finally:
+        w.stop()
+
+
+def test_fast_republish_carries_the_real_probe_age(mini_worker, monkeypatch):
+    from gpsdo_monitor import service as svc
+    seen = []
+    real_classify = svc.classify
+
+    def spy(*a, **kw):
+        seen.append(kw["probe_age_sec"])
+        return real_classify(*a, **kw)
+
+    monkeypatch.setattr(svc, "classify", spy)
+    w = mini_worker
+    w.cfg.probe_interval_sec = 10
+    w.start()
+    try:
+        w.hid.release()
+        assert _wait(lambda: w.mini.nav_pvt_count() >= 1)
+        w.build_report(host="h", now=time.time())
+        w.mini._last_feature_mono -= 7.0
+        assert w.refresh_fast(now=time.time()) is not None
+    finally:
+        w.stop()
+    assert seen[0] == pytest.approx(0.0, abs=0.5)
+    assert seen[-1] == pytest.approx(7.0, abs=0.5)
+
+
+def test_refresh_fast_reads_the_mini_once(mini_worker):
+    # A concurrent stop() can clear worker.mini between a check and a call.
+    w = mini_worker
+    w.start()
+    try:
+        w.hid.release()
+        assert _wait(lambda: w.mini.nav_pvt_count() >= 1)
+        w.build_report(host="h", now=time.time())
+        real = w.mini
+
+        class _Vanishing(DeviceWorker):
+            _reads = 0
+
+            @property
+            def mini(self):
+                type(self)._reads += 1
+                return real if type(self)._reads == 1 else None
+
+            @mini.setter
+            def mini(self, _v):
+                pass
+
+        v = _Vanishing(candidate=w.candidate, declared=w.declared, cfg=w.cfg)
+        v.last_report = w.last_report
+        assert v.refresh_fast(now=time.time()) is not None
+    finally:
+        w.stop()
+
+
+def test_a_changed_device_path_updates_the_worker(mini_worker, monkeypatch):
+    import dataclasses as dc
+    from gpsdo_monitor.discovery import DiscoveryResult
+    w = mini_worker
+    w.start()
+    try:
+        s = Service(w.cfg)
+        s._workers[w.candidate.serial] = w
+        moved = dc.replace(w.candidate, path=b"/dev/hidraw-moved")
+        s._sync_workers(DiscoveryResult(
+            matched=((w.declared, moved),), unmatched_declared=(),
+            unclaimed_present=(), errors=()))
+        assert w.candidate.path == b"/dev/hidraw-moved"
+        assert w.mini is None and w.hid.closed, \
+            "the handle on the old path must be dropped"
+    finally:
         w.stop()

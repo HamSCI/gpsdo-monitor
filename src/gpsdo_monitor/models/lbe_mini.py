@@ -68,6 +68,7 @@ READER_READ_TIMEOUT_MS = 50      # one interrupt-IN read; the lock is held this 
 STREAM_REFRESH_SEC = 30.0        # re-send the stream-enable bootstrap this often
 SNAPSHOT_STALE_SEC = 15.0        # older than this reads as "saw nothing"
 NAV_PVT_RATE_WINDOW_SEC = 60.0   # nav_pvt_rate_hz counts decodes over this window
+READER_MAX_CONSECUTIVE_ERRORS = 3  # then the reader exits and the worker reopens
 
 # Called by the reader on every decoded NAV-PVT with the host monotonic and
 # realtime clocks read at the same instant, right after the message finished
@@ -138,6 +139,9 @@ class LbeMini(GpsdoModel):
     # 60-frame × 50 ms = 3 s window. Exposed as a class attribute so
     # callers / tests can tighten it.
     nav_sample_sec: float = 3.0
+    # Reader fault handling; instance attributes so tests can shorten them.
+    reader_error_backoff_sec: float = 1.0
+    reader_join_timeout_sec: float = 2.0
 
     def __init__(self, hid) -> None:
         super().__init__(hid)
@@ -158,6 +162,11 @@ class LbeMini(GpsdoModel):
         self._snap = _NavSnapshot()
         self._pvt_stamps: deque[float] = deque()
         self._last_feature: bytes | None = None
+        self._last_feature_mono: float | None = None
+        # Set when the reader gave up on a handle that keeps failing.  The
+        # owner must then close this model and open the device afresh: a
+        # re-enumerated device never comes back on the old fd.
+        self._reader_failed = False
         self._reader_thread: threading.Thread | None = None
         self._reader_stop = threading.Event()
         self._reader_started_mono: float | None = None
@@ -250,6 +259,7 @@ class LbeMini(GpsdoModel):
             with self._hid_access():
                 buf = self.hid.feature_get(0, REPORT_SIZE)
             self._last_feature = buf
+            self._last_feature_mono = self._monotonic()
 
         extras: dict[str, object] = {}
         if self._reader_thread is not None:
@@ -485,21 +495,48 @@ class LbeMini(GpsdoModel):
         self._reader_thread = t
         t.start()
 
-    def stop_reader(self, *, timeout_sec: float = 2.0) -> None:
-        """Stop the reader thread and join it."""
+    def stop_reader(self, *, timeout_sec: float | None = None) -> bool:
+        """Stop the reader thread and join it.
+
+        Returns False when the thread is still alive after the timeout (a
+        wedged usbhid transfer can hold it inside hidapi for seconds).  The
+        thread then stays recorded, so close() knows not to free the handle
+        under it."""
         t = self._reader_thread
         if t is None:
-            return
+            return True
+        if timeout_sec is None:
+            timeout_sec = self.reader_join_timeout_sec
         self._reader_stop.set()
         t.join(timeout=timeout_sec)
         if t.is_alive():
             log.warning("Mini reader did not stop within %.1f s", timeout_sec)
+            return False
         self._reader_thread = None
         self._reader_started_mono = None
+        return True
 
     def close(self) -> None:
-        self.stop_reader()
+        # ⛔ Never close the handle while the reader may still be inside a
+        # hidapi call on it: that frees memory under C code.  Leaking one
+        # handle is the lesser fault; the thread exits once its call returns.
+        if not self.stop_reader():
+            log.warning("Mini reader still inside a HID call; leaving its "
+                        "handle open rather than freeing it under the call")
+            return
         super().close()
+
+    @property
+    def reader_failed(self) -> bool:
+        """True once the reader gave up on a handle that kept failing."""
+        return self._reader_failed
+
+    def feature_age_sec(self) -> float | None:
+        """Seconds since the last successful feature-report read, the
+        device's last good HID probe.  None before the first."""
+        if self._last_feature_mono is None:
+            return None
+        return max(0.0, self._monotonic() - self._last_feature_mono)
 
     def nav_pvt_count(self) -> int:
         """NAV-PVT messages the reader has decoded since it started."""
@@ -551,6 +588,7 @@ class LbeMini(GpsdoModel):
         ubx_buf = b""
         next_enable = self._monotonic()     # enable at once, then every 30 s
         failing = False
+        errors = 0
         timeout_s = READER_READ_TIMEOUT_MS / 1000.0
         while not self._reader_stop.is_set():
             if self._monotonic() >= next_enable:
@@ -568,14 +606,23 @@ class LbeMini(GpsdoModel):
                     raw = self.hid.read(INTERRUPT_REPORT_SIZE,
                                         timeout_ms=READER_READ_TIMEOUT_MS)
             except OSError as e:
-                # Log the transition, not every failed read: a device gone
-                # for a minute would otherwise write 1,200 lines.
+                # Log the transition, not every failed read.
+                errors += 1
                 if not failing:
                     log.warning("Mini interrupt read failing: %s", e)
                     failing = True
+                if errors >= READER_MAX_CONSECUTIVE_ERRORS:
+                    # A dead or re-enumerated device never recovers on this
+                    # fd.  Stop, and let the owner reopen the device.
+                    log.warning("Mini reader giving up after %d consecutive "
+                                "read errors; the device will be reopened",
+                                errors)
+                    self._reader_failed = True
+                    return
                 ubx_buf = b""
-                self._reader_stop.wait(1.0)
+                self._reader_stop.wait(self.reader_error_backoff_sec)
                 continue
+            errors = 0
             if failing:
                 log.info("Mini interrupt read recovered")
                 failing = False

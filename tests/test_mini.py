@@ -477,6 +477,12 @@ class _StreamFakeHid:
         self.feature_gets = 0
         self.feature_sets: list[tuple[int, bytes]] = []
         self.closed = False
+        # Fault injection: a dead device raises on every access; a wedged
+        # usbhid transfer blocks inside read until `unblock` is set.
+        self.broken_read = False
+        self.fail_next_reads = 0          # raise on this many reads, then recover
+        self.broken_feature = False
+        self.wedge: threading.Event | None = None
 
     def release(self, more: list[bytes] | None = None) -> None:
         with self._mu:
@@ -496,6 +502,8 @@ class _StreamFakeHid:
                 self._inside = None
 
     def feature_get(self, report_id: int, length: int = 60) -> bytes:
+        if self.broken_feature:
+            raise OSError("device gone")
         self._enter()
         try:
             self.feature_gets += 1
@@ -513,9 +521,17 @@ class _StreamFakeHid:
             self._leave()
 
     def read(self, length: int, timeout_ms: int | None = None) -> bytes:
+        if self.broken_read:
+            raise OSError("device gone")
+        with self._mu:
+            if self.fail_next_reads > 0:
+                self.fail_next_reads -= 1
+                raise OSError("transient")
         self._enter()
         try:
             self.reads += 1
+            if self.wedge is not None:
+                self.wedge.wait()
             time.sleep(self.READ_SLEEP_S)
             if not self._gate.is_set():
                 return b""
@@ -792,3 +808,64 @@ def test_a_setter_is_not_starved_by_a_busy_stream():
         mini.stop_reader()
     # One read holds the handle 10 ms in this fake; allow a few of them.
     assert worst < 0.05, f"a setter waited {worst * 1000:.0f} ms for the handle"
+
+
+# --- Fault handling (fix round 1) ----------------------------------------
+
+
+def test_reader_gives_up_after_three_consecutive_read_errors():
+    hid = _StreamFakeHid(_feature())
+    mini = _mini_on(hid)
+    mini.reader_error_backoff_sec = 0.01
+    mini.start_reader()
+    try:
+        assert _wait_for(lambda: hid.reads >= 2)
+        assert mini.reader_failed is False
+        hid.broken_read = True
+        assert _wait_for(lambda: mini.reader_failed, timeout=2.0)
+        t = mini._reader_thread
+        assert t is not None
+        assert _wait_for(lambda: not t.is_alive(), timeout=2.0), \
+            "a reader that gave up must exit, not retry a dead handle"
+    finally:
+        mini.close()
+    assert hid.closed
+
+
+def test_separated_read_errors_do_not_give_up():
+    # Two errors, a good read, two more: four errors, never three in a row.
+    hid = _StreamFakeHid(_feature())
+    mini = _mini_on(hid)
+    mini.reader_error_backoff_sec = 0.01
+    mini.start_reader()
+    try:
+        assert _wait_for(lambda: hid.reads >= 2)
+        for _ in range(2):
+            n = hid.reads
+            hid.fail_next_reads = 2
+            assert _wait_for(lambda: hid.fail_next_reads == 0 and hid.reads > n)
+        n = hid.reads
+        assert _wait_for(lambda: hid.reads >= n + 2)
+        assert mini.reader_failed is False
+    finally:
+        mini.close()
+
+
+def test_close_never_frees_a_handle_the_reader_is_still_inside():
+    # A wedged usbhid transfer can hold the reader inside hidapi for ~5 s.
+    # Closing the handle under it would be a use-after-free in C.
+    hid = _StreamFakeHid(_feature())
+    hid.wedge = threading.Event()
+    mini = _mini_on(hid)
+    mini.reader_join_timeout_sec = 0.05
+    mini.start_reader()
+    try:
+        assert _wait_for(lambda: hid.reads >= 1)
+        mini.close()
+        assert hid.closed is False, "handle closed under a live reader"
+        assert mini._reader_thread is not None and mini._reader_thread.is_alive()
+    finally:
+        hid.wedge.set()
+        t = mini._reader_thread
+        if t is not None:
+            t.join(timeout=2.0)

@@ -99,6 +99,11 @@ class DeviceWorker:
     # the HID stream.  None on every other model, and on a Mini whose open
     # failed (ticks then fall back to opening per probe, as before).
     mini: Optional[LbeMini] = None
+    # Set when a Mini open produced something other than an LbeMini (only
+    # test doubles do), so ticks stop retrying the continuous reader.
+    ubx_reader_unsupported: bool = False
+    # Last open attempt failed; later failures log at debug, not warning.
+    ubx_open_failed: bool = False
 
     # --- lifecycle ---------------------------------------------------
 
@@ -188,28 +193,61 @@ class DeviceWorker:
 
         Runs after _assert_drive, which opens and closes its own handle, so
         the two never hold the device at the same time."""
-        cls = REGISTRY.get(self.candidate.pid)
-        if cls is None or not cls.capabilities.has_ubx_hid:
+        if not self._wants_ubx_reader():
             return
         try:
             model = open_model(self.candidate)
         except (OSError, ValueError) as e:
-            log.warning("%s %s: could not open for continuous read (%s); "
-                        "falling back to a sample per probe",
-                        self.candidate.model, self.candidate.serial, e)
+            # Transition only: a device that stays gone would otherwise log
+            # this every probe tick.
+            (log.debug if self.ubx_open_failed else log.warning)(
+                "%s %s: could not open for continuous read (%s); "
+                "falling back to a sample per probe",
+                self.candidate.model, self.candidate.serial, e)
+            self.ubx_open_failed = True
             return
         if not isinstance(model, LbeMini):
+            self.ubx_reader_unsupported = True
             close = getattr(model, "close", None)
             if close is not None:
                 close()
             return
+        if self.ubx_open_failed:
+            log.info("%s %s: reopened for continuous read",
+                     self.candidate.model, self.candidate.serial)
+        self.ubx_open_failed = False
         model.start_reader()
         self.mini = model
 
+    def _wants_ubx_reader(self) -> bool:
+        if self.ubx_reader_unsupported:
+            return False
+        cls = REGISTRY.get(self.candidate.pid)
+        return cls is not None and bool(cls.capabilities.has_ubx_hid)
+
+    def _drop_mini(self, why: str) -> None:
+        """Close the Mini's long-lived handle; the next tick reopens it.
+
+        A USB reset shorter than a probe tick keeps the worker (it is keyed
+        by serial) but kills the fd, and the reader can never recover on a
+        dead fd.  Dropping it lets the next tick open the device afresh,
+        which is what the per-tick open used to do by construction."""
+        m = self.mini
+        if m is None:
+            return
+        self.mini = None
+        log.warning("%s %s: closing the HID handle (%s); the next probe "
+                    "reopens the device", self.candidate.model,
+                    self.candidate.serial, why)
+        try:
+            m.close()
+        except OSError as e:
+            log.debug("closing a dead Mini handle: %s", e)
+
     def stop(self) -> None:
-        if self.mini is not None:
-            self.mini.close()      # stops and joins the reader first
-            self.mini = None
+        m, self.mini = self.mini, None
+        if m is not None:
+            m.close()      # stops and joins the reader first
         if self.nmea is not None:
             self.nmea.stop()
             self.nmea = None
@@ -220,12 +258,25 @@ class DeviceWorker:
     # --- per-tick data --------------------------------------------------
 
     def build_report(self, *, host: str, now: float) -> DeviceReport:
+        m = self.mini
+        if m is not None and m.reader_failed:
+            self._drop_mini("the reader gave up on a failing handle")
+            m = None
+        if m is None and self._wants_ubx_reader():
+            self._start_ubx_reader()      # reopen after a drop
+            m = self.mini
         # A Mini with a running reader keeps its handle open; everything
         # else opens per tick, as the one-shot CLI does.
-        opener = (nullcontext(self.mini) if self.mini is not None
-                  else open_model(self.candidate))
+        opener = nullcontext(m) if m is not None else open_model(self.candidate)
         with opener as model:
-            raw = model.get_status()
+            try:
+                raw = model.get_status()
+            except OSError as e:
+                # Publish nothing for this tick, so the file's written_utc
+                # ages and consumers see the fault; reopen next tick.
+                if m is not None:
+                    self._drop_mini(f"probe failed: {e}")
+                raise
             # MON-VER is slow (several hundred ms) and the answer never
             # changes, so we try once and cache. Subsequent ticks reuse
             # the cached string.
@@ -246,9 +297,12 @@ class DeviceWorker:
                     self.firmware_source = "ubx-mon-ver"
                     self.firmware_advisory = lookup_protver(mv.protver)
 
-        return self._assemble(raw, host=host, now=now)
+        probe_age = m.feature_age_sec() if m is not None else None
+        return self._assemble(raw, host=host, now=now,
+                              probe_age_sec=probe_age or 0.0)
 
-    def _assemble(self, raw, *, host: str, now: float) -> DeviceReport:
+    def _assemble(self, raw, *, host: str, now: float,
+                  probe_age_sec: float) -> DeviceReport:
         """Turn one RawStatus into the published DeviceReport."""
         # NMEA enrichment: fresh snapshot for the tick.
         #
@@ -333,8 +387,6 @@ class DeviceWorker:
             raw.firmware = self.firmware
             raw.firmware_source = self.firmware_source
 
-        probe_age_sec = 0.0   # we just read; age is ~0 by construction
-
         a_level, reason = classify(
             raw.health,
             pps_study,
@@ -381,10 +433,19 @@ class DeviceWorker:
         need one full report first (cold start returns None)."""
         if self.nmea is not None:
             return self.refresh_nmea_only(now=now)
-        if self.mini is None or self.last_report is None:
+        # Read each once: a concurrent stop() can clear them.
+        m = self.mini
+        last = self.last_report
+        if m is None or last is None or m.reader_failed:
             return None
-        raw = self.mini.get_status(reuse_feature=True)
-        return self._assemble(raw, host=self.last_report.host, now=now)
+        # ⛔ No HID probe for 2 intervals: stop republishing.  Rebuilding
+        # from cached state would keep written_utc fresh every second and
+        # hide the fault from the staleness gates that consumers apply.
+        age = m.feature_age_sec()
+        if age is None or age > 2 * self.cfg.probe_interval_sec:
+            return None
+        raw = m.get_status(reuse_feature=True)
+        return self._assemble(raw, host=last.host, now=now, probe_age_sec=age)
 
     def refresh_nmea_only(self, *, now: float) -> Optional[DeviceReport]:
         """Build a fresh report by overlaying current NMEA state on top
@@ -565,8 +626,17 @@ class Service:
         # Start workers for new devices.
         for key, (declared, candidate) in present_by_key.items():
             if key in self._workers:
+                w = self._workers[key]
                 # Refresh declared config in case governs changed.
-                self._workers[key].declared = declared
+                w.declared = declared
+                if candidate.path != w.candidate.path:
+                    # Same serial, new node: a re-enumeration inside one
+                    # tick.  The handle on the old path is dead.
+                    log.info("device %s moved %s -> %s", key,
+                             w.candidate.path.decode(errors="replace"),
+                             candidate.path.decode(errors="replace"))
+                    w.candidate = candidate
+                    w._drop_mini("device path changed")
                 continue
             log.info("device %s %s appeared; starting worker",
                      candidate.model, key)
