@@ -37,7 +37,7 @@ from typing import Optional
 
 from gpsdo_monitor import SCHEMA_VERSION
 from gpsdo_monitor.advisories import lookup_protver
-from gpsdo_monitor.chrony_shm import ChronyShmFeed
+from gpsdo_monitor.chrony_shm import ChronyShmFeed, RESERVED_SHM_UNITS
 from gpsdo_monitor.config import Config, DeclaredDevice
 from gpsdo_monitor.discovery import DiscoveryResult, match
 from gpsdo_monitor.health import classify
@@ -67,6 +67,39 @@ log = logging.getLogger("gpsdo_monitor.service")
 
 def _sanitize(serial: str) -> str:
     return "".join(c if c.isalnum() or c in "-_" else "-" for c in serial) or "unknown"
+
+
+def _build_chrony_feed(cfg: Config) -> Optional[ChronyShmFeed]:
+    """The single choke point for whether/how the chrony SHM witness
+    feed (Task 2, mini-nav-pvt-latency) gets built. Called once from
+    `Service.start()`.
+
+    - `cfg.chrony_shm_unit is None` (the default): the feed is off.
+      Returns None WITHOUT constructing a `ChronyShmFeed` at all -- so
+      `ChronyShmFeed.open()` (and therefore `shmget`) never runs.
+    - A reserved unit (0/1/2 -- see `RESERVED_SHM_UNITS`: gpsd, and
+      hf-timestd's own FUSE/HPPS writers on an hf-timestd station):
+      refused with one loud ERROR naming the owner, feed stays off.
+      Silently opening one of these would let gpsdo-monitor's NAV-PVT
+      overwrite -- or race -- a segment another process already owns.
+    - Any other unit (3 is the fleet convention for this feed):
+      builds a `ChronyShmFeed` and calls `.open()`. `open()` itself
+      never raises and logs+disables on failure, so this always
+      returns a `ChronyShmFeed` instance for an accepted unit, whether
+      or not the underlying `shmget`/`shmat` succeeded."""
+    if cfg.chrony_shm_unit is None:
+        return None
+    owner = RESERVED_SHM_UNITS.get(cfg.chrony_shm_unit)
+    if owner is not None:
+        log.error(
+            "chrony_shm_unit=%d is reserved for %s; refusing to open it -- "
+            "the chrony SHM witness feed stays OFF. Use unit 3 (the fleet "
+            "convention for this feed) instead.",
+            cfg.chrony_shm_unit, owner)
+        return None
+    feed = ChronyShmFeed(cfg.chrony_shm_unit)
+    feed.open()   # logs + disables itself on failure; never raises
+    return feed
 
 
 # --- Per-device worker --------------------------------------------------
@@ -550,10 +583,7 @@ class Service:
 
     def start(self) -> None:
         self.cfg.run_dir.mkdir(parents=True, exist_ok=True)
-        if self.cfg.chrony_shm_unit is not None:
-            self.chrony_feed = ChronyShmFeed(self.cfg.chrony_shm_unit)
-            self.chrony_feed.open()   # logs + disables itself on failure;
-                                       # never raises (see ChronyShmFeed.open)
+        self.chrony_feed = _build_chrony_feed(self.cfg)
         if self.cfg.mdns_enabled:
             try:
                 self.advertiser = Advertiser()

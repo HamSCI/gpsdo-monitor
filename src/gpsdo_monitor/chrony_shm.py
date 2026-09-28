@@ -36,23 +36,39 @@ fields reproduce the same 96-byte memory layout. `tests/test_chrony_shm.py`
 asserts every offset against `ctypes.sizeof`/the field descriptors'
 `.offset`, rather than trusting this comment.
 
-Mode-1 writer protocol (the count/valid sequence lock chrony's
-`refclock_shm.c` and gpsd's `ntpshmwrite.c` both implement):
+Mode-1 writer protocol, matching gpsd's `ntpshm_put` (`ntpshmwrite.c`)
+order exactly — not just "an" order that keeps count even at rest, but
+the specific sequence that closes the one race that matters:
 
-    count += 1      -- odd: "a write is in progress"
-    <write every timestamp/meta field; valid untouched>
-    count += 1      -- even: "write complete", fields now stable
-    valid = 1       -- publish
+    valid = 0       -- invalidate the OLD sample first
+    count += 1      -- odd: fields below are about to change under it
+    <write every timestamp/meta field>
+    count += 1      -- even: fields are stable again
+    valid = 1       -- publish the NEW sample
 
-A reader samples `count`, copies the struct, then re-checks `count`:
-if it changed (or was ever odd, or `valid` reads 0) the sample is
-discarded and the reader retries next poll. See `write_sample()`.
+chrony's `refclock_shm.c` (`RCL_ReadShmSample`) accepts a copy unless
+exactly one of three things is true: the segment's `mode` isn't 1, the
+`count` it re-reads after copying the struct differs from the `count`
+it read before starting the copy, or `valid` reads 0. It does **not**
+check whether `count` is odd or even — that parity is this writer's
+own bookkeeping, not something the reader inspects. Which is exactly
+why `valid = 0` has to come first, not last, and can't be skipped: a
+previous sample can still read `valid == 1` right up until this write
+begins. A reader that samples `count`, copies the whole struct, and
+re-checks `count` — all *before* this writer's first `count += 1`
+lands — sees an unchanged `count` and `valid == 1`, and accepts a
+struct that starts being overwritten under it a moment later: a torn
+read chrony's count-recheck alone cannot catch, because count hadn't
+moved yet when the read started. Clearing `valid` first closes that
+window — any reader caught in it sees `valid == 0` and retries on its
+own. See `write_sample()`.
 """
 from __future__ import annotations
 
 import calendar
 import ctypes
 import ctypes.util
+import errno
 import logging
 import math
 import os
@@ -70,7 +86,23 @@ LEAP_NONE = 0
 DEFAULT_PRECISION = -10        # log2 seconds; 2**-10 s ~= 1 ms
 
 IPC_CREAT = 0o1000              # <sys/ipc.h>, Linux
-_SHM_SEGMENT_MODE = 0o600       # root-owned, per the task brief
+# World-writable when WE create the segment (it does not exist yet).
+# chrony itself is configured `perm 0666` for this unit (Task 3
+# documents the chrony.conf side) so any owner can write it; a segment
+# created 0600 would lock out every other writer including, on some
+# setups, chronyd's own reader-side permission probe.
+_SHM_SEGMENT_MODE = 0o666
+
+# Units already spoken for on an hf-timestd station (`hf-timestd
+# shm-init` makes 0-3 <owner>:0666). gpsdo-monitor must never contend
+# with an existing writer on the same segment. Unit 3 is the fleet
+# convention reserved for THIS feed -- see service._build_chrony_feed,
+# the single place that enforces this.
+RESERVED_SHM_UNITS: dict[int, str] = {
+    0: "gpsd",
+    1: "hf-timestd FUSE (writer)",
+    2: "hf-timestd HPPS (writer)",
+}
 
 
 class ShmTime(ctypes.Structure):
@@ -118,32 +150,41 @@ def _get_libc() -> ctypes.CDLL:
     return _libc
 
 
+def _time_t_is_lp64() -> bool:
+    """True when `long` is 8 bytes (LP64: x86_64 Linux).
+
+    `ShmTime.clockTimeStampSec`/`receiveTimeStampSec` are `ctypes.c_long`
+    on the assumption that this holds (the byte offsets in the module
+    docstring were derived and tested against exactly that). Off LP64
+    (e.g. a 32-bit or Windows build) `c_long` is 4 bytes and every
+    offset from `clockTimeStampUSec` onward shifts — writing through
+    would silently scribble over the wrong fields. A plain function
+    (rather than inlining the `ctypes.sizeof` check) so tests can
+    monkeypatch it without touching real `ctypes` behaviour."""
+    return ctypes.sizeof(ctypes.c_long) == 8
+
+
 # --- NAV-PVT -> SHM sample -------------------------------------------------
-#
-# UBX-NAV-PVT `valid` bitfield (u-blox protocol spec): bit0 validDate,
-# bit1 validTime, bit2 fullyResolved. `NavPvt.valid_time` (ubx.py) checks
-# only fullyResolved -- its own docstring treats that bit alone as
-# sufficient for naming a second, which is true for that consumer. This
-# feed's brief asks for the fuller set (validDate AND validTime AND
-# fullyResolved), so it reads the raw `_valid` byte directly instead of
-# widening that shared, already-tested property.
-_VALID_DATE = 0x01
-_VALID_TIME = 0x02
-_VALID_FULLY_RESOLVED = 0x04
-_VALID_TIME_MASK = _VALID_DATE | _VALID_TIME | _VALID_FULLY_RESOLVED
 
 
 def nav_pvt_clock_stamp(pvt: NavPvt) -> Optional[tuple[int, int]]:
     """The named UTC instant `pvt` describes, as `(sec, nsec)` with
     `nsec` normalised into `[0, 1e9)`.
 
-    Returns None when the fix is below 2D or the receiver has not
-    resolved date+time+leap-seconds (validDate | validTime |
-    fullyResolved, all three) — the same case the Mini's naming path
-    (`nav_pvt_utc` in ubx.py) already treats as "no usable time"."""
+    Returns None when the fix is below 2D, the receiver has not
+    resolved date+time+leap-seconds (`NavPvt.time_fully_valid` --
+    validDate | validTime | fullyResolved, all three; the same case
+    the Mini's naming path, `nav_pvt_utc` in ubx.py, already treats as
+    "no usable time"), or the reported second is a leap second (`:60`,
+    positive leap-second insertion) -- `calendar.timegm` has no
+    leap-second model and would silently fold that into the next
+    minute rather than raise, so this feed skips it and waits for the
+    next NAV-PVT (well under a second later) instead of guessing."""
     if pvt.fix_type < 2:
         return None
-    if (pvt._valid & _VALID_TIME_MASK) != _VALID_TIME_MASK:
+    if not pvt.time_fully_valid:
+        return None
+    if pvt.second == 60:
         return None
     try:
         base = calendar.timegm((
@@ -183,10 +224,12 @@ def write_sample(
 
     `shm` is anything with the `ShmTime` field names as attributes — a
     real `ShmTime` (or a `ctypes.POINTER(ShmTime)` `.contents`), or a
-    plain fake in tests. See the module docstring for the count/valid
-    ordering this follows; the short version: bump `count` odd, write
-    every field except `valid`, bump `count` even, then set `valid`.
-    Never blocks — a few attribute stores."""
+    plain fake in tests. See the module docstring for why this exact
+    order matters; the short version: invalidate the old sample first
+    (`valid = 0`), bump `count` odd, write every other field, bump
+    `count` even, then set `valid = 1`. Never blocks — a few attribute
+    stores."""
+    shm.valid = 0
     shm.count += 1
     shm.mode = MODE_1
     shm.leap = leap
@@ -262,22 +305,27 @@ class ChronyShmFeed:
     def open(self) -> bool:
         """Attach to (creating if absent) the SHM segment.
 
-        Never raises: any failure (most commonly "not root" — the
-        segment is created 0600) is logged once and the feed disables
+        Never raises: any failure is logged once and the feed disables
         itself for the rest of this process's life. The reader thread
         must never crash because chrony's SHM segment could not be
         opened; a witness that stops witnessing is strictly better than
         a dead NAV-PVT reader."""
         if self._shm is not None:
             return True
+        if not _time_t_is_lp64():
+            self._log_open_failure(
+                "ctypes.c_long is not 8 bytes on this platform; ShmTime's "
+                "time_t layout assumes LP64 (x86_64 Linux) and does not "
+                "hold here")
+            return False
         try:
             libc = _get_libc()
             shmid = libc.shmget(self.key, ctypes.sizeof(ShmTime),
                                 IPC_CREAT | _SHM_SEGMENT_MODE)
             if shmid < 0:
+                err = ctypes.get_errno()
                 self._log_open_failure(
-                    f"shmget(0x{self.key:08x}) failed "
-                    f"(errno {ctypes.get_errno()})")
+                    f"shmget(0x{self.key:08x}) failed (errno {err})", err)
                 return False
             addr = libc.shmat(shmid, None, 0)
             # shmat returns (void *) -1 on error. ctypes.c_void_p restype
@@ -285,8 +333,9 @@ class ChronyShmFeed:
             # (very large) address on others -- check both.
             bad_addr = (1 << 64) - 1
             if addr is None or addr == 0 or addr == bad_addr:
+                err = ctypes.get_errno()
                 self._log_open_failure(
-                    f"shmat(shmid={shmid}) failed (errno {ctypes.get_errno()})")
+                    f"shmat(shmid={shmid}) failed (errno {err})", err)
                 return False
             self._shmid = shmid
             self._addr = addr
@@ -299,18 +348,29 @@ class ChronyShmFeed:
                      self.unit, self.key)
             return True
         except OSError as e:
-            self._log_open_failure(str(e))
+            self._log_open_failure(str(e), getattr(e, "errno", 0) or 0)
             return False
 
-    def _log_open_failure(self, detail: str) -> None:
+    def _log_open_failure(self, detail: str, errnum: int = 0) -> None:
         self._shm = None
-        if not self._open_failed_logged:
-            log.warning(
-                "chrony SHM witness feed disabled (unit=%d key=0x%08x): %s "
-                "-- needs root (segment is created 0%o); NAV-PVT keeps "
-                "publishing to /run/gpsdo as normal",
-                self.unit, self.key, detail, _SHM_SEGMENT_MODE)
-            self._open_failed_logged = True
+        if self._open_failed_logged:
+            return
+        if errnum in (errno.EACCES, errno.EPERM):
+            # The segment exists 0666 by construction (see
+            # _SHM_SEGMENT_MODE) whenever WE create it, so EACCES/EPERM
+            # here means someone else got there first with a narrower
+            # perm -- not "you need root". Name that, not the old
+            # (wrong, once we stopped creating 0600) guess.
+            reason = (f"no write access to SHM segment 0x{self.key:08x}; "
+                     f"chronyd or another owner created it with a "
+                     f"narrower perm")
+        else:
+            reason = detail
+        log.warning(
+            "chrony SHM witness feed disabled (unit=%d key=0x%08x): %s "
+            "-- NAV-PVT keeps publishing to /run/gpsdo as normal",
+            self.unit, self.key, reason)
+        self._open_failed_logged = True
 
     def close(self) -> None:
         if self._addr is not None:

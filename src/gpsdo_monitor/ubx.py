@@ -33,6 +33,13 @@ ID_NAV_SAT = 0x35
 CLS_MON = 0x0A
 ID_MON_VER = 0x04
 
+# UBX-NAV-PVT `valid` bitfield (u-blox protocol spec): bit0 validDate,
+# bit1 validTime, bit2 fullyResolved. Used by NavPvt.time_fully_valid.
+_VALID_DATE = 0x01
+_VALID_TIME = 0x02
+_VALID_FULLY_RESOLVED = 0x04
+_VALID_TIME_MASK = _VALID_DATE | _VALID_TIME | _VALID_FULLY_RESOLVED
+
 
 def fletcher8(data: bytes) -> tuple[int, int]:
     """Compute the u-blox Fletcher-8 checksum over `data`.
@@ -137,6 +144,20 @@ class NavPvt:
         one.  Set from the `valid` byte at parse time.
         """
         return bool(self._valid & 0x04)
+
+    @property
+    def time_fully_valid(self) -> bool:
+        """Whether ALL THREE UBX time-validity bits are set: validDate
+        (bit 0), validTime (bit 1), and fullyResolved (bit 2) --
+        `_VALID_TIME_MASK` below.
+
+        Stricter than `valid_time`, which checks only fullyResolved
+        (sufficient for that property's own consumer, naming a second --
+        see its docstring). A consumer that wants the fuller guarantee
+        -- e.g. gpsdo_monitor.chrony_shm, which writes this instant into
+        a chrony SHM segment another process reads -- uses this instead
+        of reaching into `_valid` directly."""
+        return (self._valid & _VALID_TIME_MASK) == _VALID_TIME_MASK
 
     _valid: int = 0
 

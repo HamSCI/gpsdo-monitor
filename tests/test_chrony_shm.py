@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import calendar
 import ctypes
+import errno as errno_mod
 import logging
 import time
 
@@ -65,9 +66,11 @@ def test_shmtime_field_sizes():
 
 
 class _RecordingShm:
-    """A plain (non-ctypes) fake that records every field write in order,
-    proving `write_sample` only needs attribute access -- not a real
-    `ShmTime` -- and letting the handshake ORDER be asserted directly."""
+    """A plain (non-ctypes) fake that records every field write, IN
+    ORDER, as `(name, value)` pairs -- proving `write_sample` only
+    needs attribute access, not a real `ShmTime` -- and letting the
+    handshake order (and the actual values written to `valid`) be
+    asserted directly."""
 
     def __init__(self) -> None:
         object.__setattr__(self, "_sets", [])
@@ -79,21 +82,32 @@ class _RecordingShm:
         self._sets.clear()
 
     def __setattr__(self, name, value):
-        self._sets.append(name)
+        self._sets.append((name, value))
         object.__setattr__(self, name, value)
 
 
 def test_write_sample_handshake_order():
+    """gpsd's `ntpshm_put` order (ntpshmwrite.c), which chrony's
+    refclock_shm.c reader assumes: valid=0 FIRST -- closing the window
+    where a reader could copy the still-`valid==1` previous sample
+    while this write is in flight -- then count odd, fields, count
+    even, valid=1 LAST. chrony's RCL_ReadShmSample rejects a copy only
+    when mode==1 and the count it re-reads after copying differs from
+    the count it read before, OR mode isn't 1, OR valid reads 0; it
+    does NOT check count's parity, so a missing/late valid=0 is not
+    otherwise caught by that check."""
     shm = _RecordingShm()
     chrony_shm.write_sample(shm, clock_sec=10, clock_nsec=0,
                             receive_sec=20, receive_nsec=0)
     order = shm._sets
-    assert order[0] == "count", "count must bump ODD first"
-    assert order.count("count") == 2, "count bumps exactly twice per sample"
-    assert order[-2:] == ["count", "valid"], (
-        "count goes even, THEN valid publishes -- in that order, last")
-    assert "valid" not in order[:-1], (
-        "valid must not be touched before the fields are all written")
+    names = [n for n, _ in order]
+    assert order[0] == ("valid", 0), (
+        "valid must be CLEARED to 0 FIRST, before count even moves")
+    assert names[1] == "count", "count bumps ODD immediately after clearing valid"
+    assert names.count("count") == 2, "count bumps exactly twice per sample"
+    assert names.count("valid") == 2, "valid is touched exactly twice: 0, then 1"
+    assert names[-2] == "count", "count goes even just before publishing"
+    assert order[-1] == ("valid", 1), "valid = 1 publishes LAST"
 
 
 def test_write_sample_leaves_count_even_and_valid_set():
@@ -172,6 +186,28 @@ def test_nav_pvt_clock_stamp_accepts_full_valid_mask():
     assert chrony_shm.nav_pvt_clock_stamp(_pvt(_valid=0x07)) is not None
 
 
+def test_nav_pvt_clock_stamp_uses_the_public_time_fully_valid_property():
+    # Item 4c: the gate reads NavPvt.time_fully_valid (public), not the
+    # raw _valid byte directly.
+    pvt = _pvt(_valid=0x07)
+    assert pvt.time_fully_valid is True
+    assert chrony_shm.nav_pvt_clock_stamp(pvt) is not None
+    pvt2 = _pvt(_valid=0x05)   # validDate|fullyResolved, missing validTime
+    assert pvt2.time_fully_valid is False
+    assert chrony_shm.nav_pvt_clock_stamp(pvt2) is None
+
+
+def test_nav_pvt_clock_stamp_skips_leap_second_60():
+    # u-blox reports :60 during a positive leap-second insertion.
+    # calendar.timegm has no leap-second model: it would silently fold
+    # second=60 into the next minute (minute*60 + 60 == (minute+1)*60),
+    # mislabeling the sample by up to a second under the hood rather
+    # than raising. Skip instead of guessing -- the next NAV-PVT, well
+    # under a second later, carries an ordinary second.
+    pvt = _pvt(second=60)
+    assert chrony_shm.nav_pvt_clock_stamp(pvt) is None
+
+
 # --- write_nav_pvt: the invalid-fix / invalid-time skip --------------------
 
 
@@ -217,7 +253,9 @@ def test_claim_is_single_owner_first_wins():
 
 
 class _FailingLibc:
-    """shmget always fails -- simulates "not root" against a 0600 segment."""
+    """shmget always fails, with no specific errno set -- the generic
+    "something went wrong" case (as opposed to the EACCES/EPERM-specific
+    wording exercised by test_open_permission_failure_names_the_real_problem)."""
 
     def shmget(self, key, size, flags):
         return -1
@@ -285,6 +323,91 @@ def test_open_success_initializes_static_fields_and_writes_through(monkeypatch):
     assert feed.connected is False
 
 
+class _FlagCapturingLibc(_FakeOkLibc):
+    """Records the flags shmget() was called with, so the CREATE mode
+    bits can be asserted directly."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.shmget_flags: int | None = None
+
+    def shmget(self, key, size, flags):
+        self.shmget_flags = flags
+        return super().shmget(key, size, flags)
+
+
+def test_open_creates_segment_world_writable_0666(monkeypatch):
+    # Absent-segment creation must use 0666, not 0600: chrony is
+    # configured with `perm 0666` (Task 3) and a segment created 0600
+    # would be unreadable/unwritable by anyone else, including chronyd
+    # itself on some setups.
+    fake = _FlagCapturingLibc()
+    monkeypatch.setattr(chrony_shm, "_get_libc", lambda: fake)
+    feed = ChronyShmFeed(unit=3)
+    assert feed.open() is True
+    assert fake.shmget_flags is not None
+    assert fake.shmget_flags & 0o777 == 0o666
+    assert fake.shmget_flags & chrony_shm.IPC_CREAT
+
+
+class _PermissionDeniedLibc:
+    """shmget fails with a specific errno -- EACCES or EPERM -- the way
+    a real "segment exists, owned by someone else, narrower perm" would."""
+
+    def __init__(self, err: int) -> None:
+        self._err = err
+
+    def shmget(self, key, size, flags):
+        ctypes.set_errno(self._err)
+        return -1
+
+    def shmat(self, shmid, addr, flags):  # pragma: no cover - not reached
+        raise AssertionError("shmat must not be called after shmget fails")
+
+    def shmdt(self, addr):
+        return 0
+
+
+@pytest.mark.parametrize("err", [errno_mod.EACCES, errno_mod.EPERM])
+def test_open_permission_failure_names_the_real_problem(monkeypatch, caplog, err):
+    monkeypatch.setattr(chrony_shm, "_get_libc", lambda: _PermissionDeniedLibc(err))
+    feed = ChronyShmFeed(unit=3)
+    with caplog.at_level(logging.WARNING, logger="gpsdo_monitor.chrony_shm"):
+        assert feed.open() is False
+    msg = caplog.records[-1].getMessage()
+    assert "no write access to SHM segment" in msg
+    assert "narrower perm" in msg
+    assert "needs root" not in msg, (
+        "stale wording -- the segment is 0666 now, so EACCES/EPERM means "
+        "someone else already owns it with a narrower perm, not 'run as root'")
+
+
+def test_open_refuses_off_lp64_platforms(monkeypatch, caplog):
+    # ShmTime's time_t fields assume `long` is 8 bytes (LP64: x86_64
+    # Linux). Off that, the documented byte offsets don't hold and
+    # writing through would silently corrupt the segment for chrony.
+    monkeypatch.setattr(chrony_shm, "_time_t_is_lp64", lambda: False)
+
+    class _UnreachableLibc:
+        def shmget(self, *a):  # pragma: no cover - must not run
+            raise AssertionError("shmget must not run off LP64")
+
+        def shmat(self, *a):  # pragma: no cover - must not run
+            raise AssertionError("shmat must not run off LP64")
+
+        def shmdt(self, addr):
+            return 0
+
+    monkeypatch.setattr(chrony_shm, "_get_libc", lambda: _UnreachableLibc())
+    feed = ChronyShmFeed(unit=3)
+    with caplog.at_level(logging.WARNING, logger="gpsdo_monitor.chrony_shm"):
+        assert feed.open() is False
+        assert feed.open() is False   # still refuses, still one log line
+    assert feed.connected is False
+    warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert len(warnings) == 1
+
+
 # --- config default + parsing -----------------------------------------------
 
 
@@ -306,18 +429,64 @@ def test_config_missing_chrony_shm_unit_parses_as_none(tmp_path):
     assert cfg.chrony_shm_unit is None
 
 
-def test_build_feed_returns_none_and_opens_nothing_when_unit_is_none(monkeypatch):
-    def _boom():
+# --- service._build_chrony_feed: the ONE choke point ------------------------
+#
+# Previously this guard was copy-pasted into the test itself ("decorative" --
+# it proved the copy worked, not the code). It now lives at
+# service._build_chrony_feed and is exercised directly.
+
+
+def test_build_chrony_feed_returns_none_and_opens_nothing_when_unit_is_none(monkeypatch):
+    from gpsdo_monitor.service import _build_chrony_feed
+
+    def _boom(self):
         raise AssertionError("open() must not run when chrony_shm_unit is None")
-    monkeypatch.setattr(ChronyShmFeed, "open", lambda self: _boom())
-    from gpsdo_monitor.service import Service
-    svc = Service(Config(chrony_shm_unit=None, mdns_enabled=False))
-    # Only the chrony-feed half of start(); avoid mdns/signal-handler
-    # side effects that don't belong to this test.
-    if svc.cfg.chrony_shm_unit is not None:
-        svc.chrony_feed = ChronyShmFeed(svc.cfg.chrony_shm_unit)
-        svc.chrony_feed.open()
-    assert svc.chrony_feed is None
+    monkeypatch.setattr(ChronyShmFeed, "open", _boom)
+    assert _build_chrony_feed(Config(chrony_shm_unit=None)) is None
+
+
+def test_build_chrony_feed_refuses_reserved_units_and_names_the_owner(monkeypatch, caplog):
+    from gpsdo_monitor.service import _build_chrony_feed
+
+    def _boom(self):
+        raise AssertionError("open() must not run for a reserved unit")
+    monkeypatch.setattr(ChronyShmFeed, "open", _boom)
+
+    assert chrony_shm.RESERVED_SHM_UNITS.keys() == {0, 1, 2}
+    for unit, owner in chrony_shm.RESERVED_SHM_UNITS.items():
+        caplog.clear()
+        with caplog.at_level(logging.ERROR, logger="gpsdo_monitor.service"):
+            result = _build_chrony_feed(Config(chrony_shm_unit=unit))
+        assert result is None, f"unit {unit} ({owner}) must be refused"
+        errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+        assert len(errors) == 1, f"unit {unit} must log exactly one ERROR"
+        assert owner in errors[0].getMessage(), (
+            f"the refusal must NAME the owner ({owner!r}) of unit {unit}")
+
+
+def test_build_chrony_feed_accepts_unit_3(monkeypatch):
+    from gpsdo_monitor.service import _build_chrony_feed
+    monkeypatch.setattr(ChronyShmFeed, "open", lambda self: True)
+    feed = _build_chrony_feed(Config(chrony_shm_unit=3))
+    assert isinstance(feed, ChronyShmFeed)
+    assert feed.unit == 3
+
+
+def test_build_chrony_feed_mutation_ignoring_none_is_caught():
+    """The fix-round-1 mutation target for item 3: a `_build_chrony_feed`
+    that forgot its `unit is None -> None` guard must fail some test.
+    This test documents what that failure looks like -- it does not
+    itself mutate the source (the source mutation + full-suite run is
+    done by hand and recorded in the commit body's "Mutations:" section
+    and task-2-report.md, matching how the swap-mutation for write_sample
+    is handled elsewhere in this file)."""
+    from gpsdo_monitor.service import _build_chrony_feed
+    # A correct helper never even constructs a ChronyShmFeed for None,
+    # so it never reaches the unit arithmetic in ChronyShmFeed.__init__.
+    # A mutant missing the early return falls through to
+    # `ChronyShmFeed(None)`, whose `SHM_KEY_BASE + None` raises TypeError
+    # -- so this call not raising IS the assertion.
+    assert _build_chrony_feed(Config(chrony_shm_unit=None)) is None
 
 
 # --- wiring: the Task 1 hook feeds this writer with mono/real --------------
@@ -381,13 +550,13 @@ def test_second_mini_worker_does_not_get_the_feed(monkeypatch, tmp_path):
     monkeypatch.setattr(svc_mod, "open_model", _open)
     monkeypatch.setattr(svc_mod, "find_ttys_by_usb_serial", lambda _s: [])
 
-    feed = ChronyShmFeed(unit=0)
+    feed = ChronyShmFeed(unit=3)   # 3 = the fleet convention; 0-2 are reserved
     # Simulate an already-open feed without touching real SHM: the hook
     # only needs a `_shm`-shaped target to write into.
     feed._shm = ShmTime()
 
     cfg = Config(run_dir=tmp_path / "run", mdns_enabled=False, min_drive_ma=0,
-                pps_study_enabled=False, devices=[], chrony_shm_unit=0)
+                pps_study_enabled=False, devices=[], chrony_shm_unit=3)
 
     cand_a = _mini_candidate("AAA")
     cand_b = _mini_candidate("BBB")
