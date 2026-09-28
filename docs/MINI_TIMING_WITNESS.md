@@ -48,9 +48,10 @@ and so on. Add `chrony_shm_unit` as ONE MORE KEY inside that same
 `[monitor]` table, above any `[[monitor.device]]` header in the file (TOML
 reads everything between a table header and the next one as belonging to
 it, so a key placed after `[[monitor.device]]` would land in the wrong
-table). Do **not** write a second `[monitor]` block — TOML lets you, but
-`Config.from_file` only reads the first one it parses, so anything in a
-second block is silently ignored:
+table). Do **not** write a second `[monitor]` block — this is not TOML
+that "just" gets misread. `tomllib` refuses to parse it at all
+(`TOMLDecodeError: Cannot declare ('monitor',) twice`), so gpsdo-monitor
+fails to start rather than silently ignoring the second block:
 
 ```toml
 [monitor]
@@ -73,8 +74,11 @@ python3 -c 'import tomllib;print(tomllib.load(open("/etc/gpsdo-monitor/config.to
 ```
 
 This must print `3`. If it prints `None`, the key is outside `[monitor]`
-(most likely after a `[[monitor.device]]` header) or inside a second
-`[monitor]` block.
+— most likely after a `[[monitor.device]]` header. If this one-liner
+instead prints a `TOMLDecodeError` traceback, the file has a second
+`[monitor]` block; gpsdo-monitor won't start until it's merged back into
+one. A second `[monitor]` block is not a "gets ignored" mistake — it's a
+"nothing starts" mistake, on both the check above and the real daemon.
 
 Restart `gpsdo-monitor.service`. The daemon runs as `User=gpsdo`; if the SHM
 segment doesn't exist yet, it creates one world-writable (`0666`). If
@@ -164,26 +168,40 @@ existing `log` line to add `refclocks` to it, rather than adding a second
 
 ### 5. Before you restart chronyd
 
-Restarting chronyd is not as quiet as it looks. On an hf-timestd station,
-chrony's systemd unit carries a drop-in
-(`hf-timestd/systemd/chronyd-timestd-shm.conf`, installed to
-`chrony.service.d/`) with `Wants=` on `timestd-metrology.target`,
-`timestd-l2-calibration.service`, `timestd-fusion.service`, and
-`timestd-core-recorder.service`. Restarting chrony starts any of those
-that are currently stopped — this restart is not just "reload chrony's
-config," it can also start hf-timestd services that were deliberately
-down.
+Restarting chronyd is not as quiet as it looks — on SOME stations. Find
+out what this station's chrony unit actually pulls in, rather than
+assuming a fixed list:
+
+```
+systemctl show -p Wants -p After chrony.service
+```
+
+If that prints hf-timestd units (`timestd-metrology.target`,
+`timestd-l2-calibration.service`, `timestd-fusion.service`,
+`timestd-core-recorder.service`, or similar), restarting chrony starts
+any of them that are currently stopped — this restart is not just
+"reload chrony's config," it can also start hf-timestd services that
+were deliberately down. Check each one `systemctl show` named:
+
+```
+systemctl is-active <unit1> <unit2> ...
+```
+
+Some stations carry no such drop-in at all — AC0G-ND, checked
+2026-09-28, has none — and there a chrony restart starts nothing else.
+Run the `systemctl show` command above and read what it actually says for
+THIS station; don't assume either way.
 
 The restart also resets chrony's own NTP source selection: the `*`
 (selected) source can change while chrony re-picks one. hf-timestd's
 offset_judge tells T4 from T2 apart by whether the selected source sits
 on the LAN, so a restart can shift that classification until chrony
-reconverges (a few minutes, ordinarily). And if T6 is enabled,
-`timestd-hpps-watchdog` restarts `timestd-core-recorder` after HPPS goes
-quiet for a while (`HPPS_LASTRX_THRESHOLD_S`, currently 600 s in
-`timestd-hpps-watchdog.service` — check the live value on the station,
-it has changed before) — a chrony restart briefly removes the HPPS
-refclock, so it can count toward that.
+reconverges (a few minutes, ordinarily). If T6 is enabled and one of the
+`Wants=` units above is a core-recorder, `timestd-hpps-watchdog` can
+restart it after HPPS goes quiet for a while — but the chrony restart
+itself is over in a second or two, nowhere near the 600 s
+`HPPS_LASTRX_THRESHOLD_S` threshold that watchdog uses, so on its own a
+chrony restart is very unlikely to trip it.
 
 None of this touches the MINI refclock itself: chrony reads refclocks
 only from its config files, and this drop-in's effect survives a
@@ -198,24 +216,34 @@ Before restarting, record what the station looks like right now:
 ```
 chronyc -n sources
 chronyc tracking
-systemctl is-active timestd-metrology.target timestd-l2-calibration.service \
-    timestd-fusion.service timestd-core-recorder.service timestd-hpps-watchdog.timer
+systemctl show -p Wants -p After chrony.service
+systemctl is-active <every unit that command named>
 ```
 
-Also check whether T6 is armed and whether gpsd is present — both change
-what the restart can disturb:
+Also check whether T6 is armed, with `tomllib` rather than `grep` (a
+value nested this way — `[timing.t6_pps]` inside `[timing]` — is easy to
+mis-grep past a sibling table with the same short name):
 
 ```
-grep -A3 '^\[timing.t6_pps\]' /etc/hf-timestd/timestd-config.toml   # enabled = ?
+python3 -c 'import tomllib;print(tomllib.load(open("/etc/hf-timestd/timestd-config.toml","rb")).get("timing",{}).get("t6_pps",{}).get("enabled"))'
+```
+
+And check gpsd:
+
+```
 systemctl is-active gpsd
 ```
+
+gpsd matters here because it owns chrony's SHM unit 0 — if gpsd is
+inactive, nothing else on the station is writing that unit, so a chrony
+restart can't disturb it either way.
 
 On a sigmond station, chrony restarts normally belong to the sigmond
 reconciler, not to an operator running `systemctl restart` by hand.
 **Announce the restart and get the operator's go before running it.**
 
-Repeat the same three commands after the restart, plus `chronyc sources`
-for MINI's own row once it appears. "Before/after" means: the same
+Repeat the same commands after the restart, plus `chronyc sources` for
+MINI's own row once it appears. "Before/after" means: the same
 `chronyc -n sources` / `chronyc tracking` / `systemctl is-active` rows,
 now including MINI, and the same `*` (selected) source back in place
 after 5–10 minutes of reconvergence.
@@ -392,13 +420,56 @@ does one message's offset move from the next."
 The short-tau statistic answers that narrower question. For each pair of
 consecutive raw MINI samples no more than `--gap-threshold-sec` apart, take
 the difference between them. The **standard deviation of those
-differences, divided by √2**, is the value reported. For a white-noise
-process this equals the two-sample (Allan) deviation at τ = one message
-period — the standard formula from time-and-frequency metrology for "how
-much does this quantity change from one sample to the next" (see W.J.
-Riley, *Handbook of Frequency Stability Analysis*, NIST SP 1065). The
-script reports the same statistic for the MINI − FUSE differences too, when
-there are enough consecutive paired points.
+differences, divided by √2**, is the value reported.
+
+Be precise about what that is. The textbook two-sample deviation of a
+series x sampled at spacing τ is
+
+```
+σ(τ) = √( ½ · mean( (x[i+1] − x[i])² ) )
+```
+
+— the root-mean-square first difference, with no mean subtracted. What
+the script actually computes is `stdev(diffs) / √2`, using a mean-SUBTRACTED
+standard deviation (Python's `statistics.stdev`). Subtracting the mean
+difference removes a constant drift — a steady frequency offset — that the
+textbook formula would not remove. That's a deliberate choice, not a
+rounding difference: it means the script's number and the textbook σ(τ)
+are related but not identical quantities.
+
+This estimator equals the Allan deviation of the offset series only **in
+expectation**, for white noise: it's unbiased across many hypothetical
+repeats of the same measurement, not an exact reading of "the" Allan
+deviation from one finite run, and it says nothing about non-white noise
+(drift, flicker) beyond removing a constant term. It is also **not**
+Riley's phase-data AVAR (W.J. Riley, *Handbook of Frequency Stability
+Analysis*, NIST SP 1065) — that formula takes SECOND differences of
+phase/time data to get a true frequency-noise Allan deviation. MINI's
+offsets here are differenced once, not twice. Riley is the right
+reference for the general family of two-sample-deviation statistics; it
+is not a citation for this exact formula.
+
+τ is not pinned at exactly "one message period," either. It's whatever a
+given pair's spacing happens to be — anywhere from just over 0 s up to
+`--gap-threshold-sec` (40 s by default), since the Mini's message rate
+isn't perfectly regular and a real outage gets excluded rather than
+bridged. The script reports `median_spacing_sec` alongside the value, so
+you can see what τ actually meant for a given run instead of assuming a
+single number.
+
+The script reports the same statistic for the MINI − FUSE differences
+too, when there are enough consecutive paired points — using a
+**different pairing** than the plain MINI − FUSE numbers above. Pairing
+every MINI sample to its own nearest FUSE sample (as the plain numbers
+do) lets several consecutive MINI samples share ONE FUSE sample; a
+difference built from two diffs that both used the same FUSE sample is
+really just the difference between two MINI offsets, with FUSE canceled
+out completely. The short-tau series instead pairs one point per FUSE
+sample — the nearest MINI sample to each one — so every included
+difference spans two distinct FUSE samples. When FUSE is polled less
+often than `--gap-threshold-sec`, this can honestly yield too few
+consecutive pairs to report a value, even `n_diffs: 0` — that's a correct
+statement about FUSE's polling rate, not a bug.
 
 Three numbers, three different questions:
 
