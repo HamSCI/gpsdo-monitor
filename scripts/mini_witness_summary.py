@@ -25,6 +25,16 @@ string). Nine whitespace-separated columns per data line:
        samples.
     9  Assumed dispersion of the sample
 
+RAW vs FILTERED (chrony 4.6.1's `refclock.c`): a RAW line (column 4 is a
+number) is logged once per driver poll -- for the SHM driver, essentially
+once per delivered message -- by `RCL_AddSample()`. A FILTERED line
+(column 4 is "-") is logged once per refclock `poll` interval by
+`poll_timeout()`, from chrony's own filter combining every raw sample
+accumulated in that window; it is chrony's belief about the source, not a
+record of one message's arrival. Since the question this tool answers is
+about one message's arrival, `parse_refclocks_log()` below reads RAW
+lines into the statistics and counts (not silently drops) FILTERED ones.
+
 `chronyd` also periodically re-prints a banner (a line of "="
 characters, the column-header text, another "=" line) into the same
 file -- every `logbanner` writes, default 32. Those lines are skipped,
@@ -49,11 +59,13 @@ from typing import NamedTuple
 DEFAULT_LOG_PATH = "/var/log/chrony/refclocks.log"
 DEFAULT_MINI_REFID = "MINI"
 DEFAULT_FUSE_REFID = "FUSE"
-# Half the drop-in's nominal poll interval (`poll 4` = 2**4 = 16 s), so a
-# MINI sample is never paired with a FUSE sample from the adjacent cycle.
+# A raw sample's cadence tracks the writer's own message rate (NAV-PVT,
+# ~1 Hz), not the refclock's `poll` setting -- see the module docstring's
+# RAW vs FILTERED note. This is a fixed, conservative cap comfortably
+# inside one `poll 4` filter window (16 s), not a tuned fraction of it.
 DEFAULT_MAX_PAIR_GAP_SEC = 8.0
-# A missed poll or two (poll 4 = 16 s nominal) is normal jitter; a hole
-# this wide is not.
+# A fixed floor meant to catch a real outage, not a multiple of the
+# expected per-message spacing.
 DEFAULT_GAP_THRESHOLD_SEC = 40.0
 
 _DATE_LEN = 10   # "YYYY-MM-DD"
@@ -66,6 +78,7 @@ class LayoutError(RuntimeError):
 class Sample(NamedTuple):
     ts: datetime
     offset_s: float
+    is_filtered: bool = False
 
 
 def _is_banner_line(stripped: str) -> bool:
@@ -94,7 +107,13 @@ def _parse_line(line: str, line_no: int, path: str) -> tuple[str, Sample] | None
         )
 
     date_field, time_field, refid = fields[0], fields[1], fields[2]
+    driver_poll_seq_field = fields[3]
     cooked_offset_field = fields[7]
+    # Column 4: a number on a RAW sample (one driver poll), "-" on a
+    # FILTERED sample (chrony's combined estimate over the whole `poll`
+    # interval -- see the module docstring). Only raw samples are one
+    # message's arrival, which is what this tool measures.
+    is_filtered = driver_poll_seq_field == "-"
 
     try:
         if "." in time_field:
@@ -125,12 +144,21 @@ def _parse_line(line: str, line_no: int, path: str) -> tuple[str, Sample] | None
             f"{stripped!r} ({exc})"
         ) from exc
 
-    return refid, Sample(ts=ts, offset_s=offset_s)
+    return refid, Sample(ts=ts, offset_s=offset_s, is_filtered=is_filtered)
 
 
-def parse_refclocks_log(path: Path, mini_refid: str, fuse_refid: str) -> tuple[list[Sample], list[Sample]]:
+class ParsedLog(NamedTuple):
+    mini: list[Sample]
+    fuse: list[Sample]
+    mini_filtered_skipped: int
+    fuse_filtered_skipped: int
+
+
+def parse_refclocks_log(path: Path, mini_refid: str, fuse_refid: str) -> ParsedLog:
     mini: list[Sample] = []
     fuse: list[Sample] = []
+    mini_filtered_skipped = 0
+    fuse_filtered_skipped = 0
     text = path.read_text()
     for line_no, line in enumerate(text.splitlines(), start=1):
         parsed = _parse_line(line, line_no, str(path))
@@ -138,12 +166,18 @@ def parse_refclocks_log(path: Path, mini_refid: str, fuse_refid: str) -> tuple[l
             continue
         refid, sample = parsed
         if refid == mini_refid:
-            mini.append(sample)
+            if sample.is_filtered:
+                mini_filtered_skipped += 1
+            else:
+                mini.append(sample)
         elif refid == fuse_refid:
-            fuse.append(sample)
+            if sample.is_filtered:
+                fuse_filtered_skipped += 1
+            else:
+                fuse.append(sample)
     mini.sort(key=lambda s: s.ts)
     fuse.sort(key=lambda s: s.ts)
-    return mini, fuse
+    return ParsedLog(mini, fuse, mini_filtered_skipped, fuse_filtered_skipped)
 
 
 def _stats_ms(offsets_s: list[float]) -> dict:
@@ -213,7 +247,8 @@ def summarize(
     max_pair_gap_sec: float = DEFAULT_MAX_PAIR_GAP_SEC,
     gap_threshold_sec: float = DEFAULT_GAP_THRESHOLD_SEC,
 ) -> dict:
-    mini, fuse = parse_refclocks_log(path, mini_refid, fuse_refid)
+    parsed = parse_refclocks_log(path, mini_refid, fuse_refid)
+    mini, fuse = parsed.mini, parsed.fuse
 
     if not mini:
         raise LayoutError(
@@ -241,6 +276,8 @@ def summarize(
         "diff_mini_minus_fuse": diff_stats,
         "mini_rate": _rate(mini),
         "fuse_rate": _rate(fuse),
+        "mini_filtered_skipped": parsed.mini_filtered_skipped,
+        "fuse_filtered_skipped": parsed.fuse_filtered_skipped,
         "gap_threshold_sec": gap_threshold_sec,
         "mini_gaps": _gaps(mini, gap_threshold_sec),
         "fuse_gaps": _gaps(fuse, gap_threshold_sec),
@@ -279,6 +316,11 @@ def render_text(result: dict) -> str:
             return f"{tag} {r['n']} samples"
         return f"{tag} {r['n']} samples over {r['span_sec']:.1f}s ({r['samples_per_hour']:.1f}/hr)"
     lines.append(f"sample rate: {_rate_str(result['mini_refid'], mr)}; {_rate_str(result['fuse_refid'], fr)}")
+    lines.append(
+        f"filtered lines skipped (not raw, not counted above): "
+        f"{result['mini_refid']} {result['mini_filtered_skipped']}; "
+        f"{result['fuse_refid']} {result['fuse_filtered_skipped']}"
+    )
 
     gt = result["gap_threshold_sec"]
     for tag, gaps in ((result["mini_refid"], result["mini_gaps"]), (result["fuse_refid"], result["fuse_gaps"])):

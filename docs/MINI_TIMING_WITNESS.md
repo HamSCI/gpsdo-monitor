@@ -2,7 +2,7 @@
 
 > **Audience:** operator
 > **Status:** current
-> **Verified against:** gpsdo-monitor Task 2 (chrony_shm.py, commits afdea64/4ee888f) and AC0G-ND's live chrony layout, 2026-09-28
+> **Verified against:** gpsdo-monitor Task 2 (chrony_shm.py, commits afdea64/4ee888f), AC0G-ND's live chrony layout, and chrony 4.6.1 source (`conf.c`, `refclock.c`, `refclock_shm.c`, `logging.c`), 2026-09-28
 
 This tells an operator how to turn on the LBE-Mini's chrony feed and how to
 read the number it produces. It answers one question: **how tightly does a
@@ -50,11 +50,27 @@ that gap from chrony's side too.
 Write `/etc/chrony/conf.d/gpsdo-mini-witness.conf`:
 
 ```
-refclock SHM 3 refid MINI poll 4 precision 1e-3 noselect perm 0666
+refclock SHM 3:perm=0666 refid MINI poll 4 precision 1e-3 noselect
 log refclocks
 ```
 
-Keep it in its own file. Don't add these lines to hf-timestd's
+`perm` is a **driver** option, not a refclock keyword. chrony attaches a
+driver option to the driver parameter with a colon — `man chrony.conf(5)`
+gives exactly this pattern as its own example, `refclock SHM 1:perm=0644
+refid GPS2`. Writing `perm 0666` as a free-standing word, the way an
+earlier draft of this doc had it, breaks the parse: chrony's
+`parse_refclock()` (`conf.c`) has no top-level `perm` keyword, so it calls
+`other_parse_error("Invalid refclock option")` — which is fatal. chronyd
+logs the error and exits (`logging.c`'s `LOG_FATAL` macro ends in
+`exit(1)`) instead of starting. Get this wrong and the service that's
+supposed to be a passive witness takes chronyd down with it.
+
+`precision 1e-3` stays a free-standing refclock option — that part was
+always correct. chrony ignores whatever precision value the SHM segment's
+own struct field carries (`refclock_shm.c`'s `shm_poll()` never reads
+`t.precision`); this config value is the only one that counts.
+
+Keep the file on its own. Don't add these lines to hf-timestd's
 `timestd-refclocks.conf` — AC0G-ND has already lived through the trouble two
 files fighting over `refid FUSE` cause
 (`ops/memory/reference_chrony_duplicate_refclock_dropin.md`), and this feed
@@ -63,15 +79,30 @@ has no reason to risk the same trap.
 `noselect` keeps this a witness: chronyd measures MINI against the system
 clock, and never steers on it.
 
-`perm 0666` matters only if gpsdo-monitor didn't create the segment first
+`:perm=0666` matters only if gpsdo-monitor didn't create the segment first
 (hf-timestd's `shm-init` already leaves units 0–3 at `0666` on a station
-running it). It costs nothing where the segment already exists, so the
-drop-in carries it unconditionally.
+running it). It costs nothing where the segment already exists —
+`refclock_shm.c` only consults it inside `shmget(..., IPC_CREAT | perm)`,
+which is a no-op once the segment is already there — so the drop-in
+carries it unconditionally.
 
 If `chrony.conf` names no `logdir`, add `logdir /var/log/chrony` too — check
 first with `grep -r logdir /etc/chrony/`.
 
-### 3. Add the log line, without breaking what's already logging
+### 3. Verify the drop-in parses, before restarting anything
+
+```
+sudo chronyd -p
+```
+
+`-p` makes chronyd read its whole configuration — `chrony.conf` plus every
+file `confdir` pulls in, this drop-in included — print it in normalized
+form, and exit without touching whatever chronyd is already running
+(`chronyd.adoc`: "verify the syntax of the configuration"). A bad drop-in
+fails here, loudly, naming the bad line. That beats finding out when
+`systemctl restart chrony` fails instead.
+
+### 4. Add the log line, without breaking what's already logging
 
 `log refclocks` is additive. Reading chrony 4.6.1's own parser confirms
 it: each `log` line only ever turns options **on** (`conf.c`'s `parse_log()`
@@ -83,7 +114,7 @@ turns out to disagree, the safe alternative is editing that station's
 existing `log` line to add `refclocks` to it, rather than adding a second
 `log` line.
 
-### 4. Restart chrony
+### 5. Restart chrony
 
 ```
 systemctl restart chrony
@@ -96,13 +127,21 @@ host, gone within a few polls.
 ## Confirm it's running
 
 ```
+chronyc sources
+```
+
+MINI shows a `#?` row there — never selected, `noselect` in effect. `sources`
+names the row but doesn't carry the numbers. For those:
+
+```
 chronyc sourcestats
 ```
 
-MINI shows a `#?` row (never selected, `noselect` in effect) with an offset
-and standard deviation chrony has measured against the system clock. If the
-row never appears, or its reach stays 0, the drop-in didn't load or the feed
-never opened the segment — check `journalctl -u gpsdo-monitor` and
+MINI's row here carries `NP` (sample count), `Offset`, and `Std Dev` —
+chrony's own measurement of MINI against the system clock. If MINI never
+appears in either command, or `sources`' Reach column for it stays 0, the
+drop-in didn't load or the feed never opened the segment — check
+`journalctl -u gpsdo-monitor` and
 `ipcs -m | grep $(printf '0x%x' $((0x4e545030 + 3)))` for who's attached.
 
 ## Read the raw samples: `refclocks.log`
@@ -133,18 +172,46 @@ Nine whitespace-separated columns per data line:
 | 8 | **Cooked offset** — local clock error with corrections applied. Positive means the local clock is slow. | `1.234000e-03` |
 | 9 | Assumed dispersion of the sample | `1.000e-03` |
 
-**Column 8 is the number this doc and the summary script read.** It's
-populated on both raw and filtered samples, unlike columns 4, 6, and 7.
+**Column 8 is the number this doc and the summary script read**, and it's
+populated on both kinds of line. The two kinds answer different questions,
+though.
+
+A **raw** line (column 4 holds a number) logs one driver poll. For MINI and
+FUSE that means essentially one delivered message: `chrony_shm.py` writes a
+fresh SHM sample on every NAV-PVT, and this drop-in doesn't slow the
+driver's own poll rate down to `poll 4` — that setting paces something
+else (next paragraph). A **filtered** line (column 4 holds `-`) logs
+chrony's own combined estimate over the refclock's whole `poll` interval,
+built from every raw sample chrony accumulated in that window
+(`refclock.c`'s `poll_timeout()`). It answers "what does chrony currently
+believe this source reads" — an input to source selection, not a record of
+one message's arrival.
+
+The question this doc opened with is about one message's arrival. So **the
+summary script reads raw lines only** and skips filtered ones — counting
+them, not silently dropping them; `--json` output says how many it left
+out per refclock.
 
 ## The decisive comparison: MINI against hf-timestd's own fusion
 
-AC0G-ND's system clock follows NTP with FUSE and HPPS both `noselect` since
-2026-09-10 — so chrony measures every refclock, including MINI, against the
-same host clock, and that host clock's own error cancels when you difference
-two refclocks against it. Pair MINI's offset with FUSE's at the nearest
-timestamp: `MINI_offset(t) − FUSE_offset(t)` measures the Mini against
-hf-timestd's WWV/WWVH fusion, not against whatever chrony currently thinks
-the system clock reads.
+AC0G-ND's system clock follows NTP. FUSE and HPPS have both run `noselect`
+since 2026-09-10. So chrony measures every refclock — MINI included —
+against that same host clock. Difference two refclocks measured against
+the same clock, and the host clock's own error cancels out of the result.
+
+Pair MINI's offset with FUSE's at the nearest timestamp:
+`MINI_offset(t) − FUSE_offset(t)` measures the Mini against hf-timestd's
+WWV/WWVH fusion, not against whatever chrony currently thinks the system
+clock reads.
+
+The pairing window matters here only if the host clock drifts during it.
+Once chrony has locked — skew held to a few ppm, its normal steady state —
+the host clock moves a few tens of nanoseconds over the default 8 s
+`--max-pair-gap-sec` window: far below the millisecond offsets this
+comparison measures. A host clock still slewing hard needs fixing on its
+own terms first; ops has seen that state before
+(`ops/memory/project_host_clock_runaway_20260904.md`), and this comparison
+means little while it lasts.
 
 ## `scripts/mini_witness_summary.sh`
 
@@ -153,14 +220,20 @@ A thin wrapper over a stdlib-only Python helper
 banner lines, and reports:
 
 - MINI: mean, median, standard deviation, and MAD (median absolute
-  deviation from the median, unscaled) of column 8, in milliseconds.
+  deviation from the median, unscaled) of column 8 on **raw** lines only,
+  in milliseconds. Filtered lines (column 4 = `-`) are counted and
+  reported separately, never folded into these statistics — see "raw vs
+  filtered" above.
 - MINI − FUSE: the same four statistics over the paired differences, plus
   how many MINI samples had no FUSE sample close enough to pair with.
 - Sample rate for each refclock (count and samples/hour over the span the
   log covers).
-- Gaps: any interval between consecutive samples on a refclock wider than
-  40 s (roughly two and a half missed polls at the drop-in's `poll 4`, 16 s
-  nominal spacing) — configurable with `--gap-threshold-sec`.
+- Gaps: any interval between consecutive raw samples on a refclock wider
+  than 40 s — configurable with `--gap-threshold-sec`. Raw samples track
+  the writer's own message rate, not `poll 4` (that setting paces
+  chrony's filtered estimate, not the raw log — see above), so 40 s is a
+  fixed, conservative floor meant to catch a real outage, not a tuned
+  multiple of anything.
 
 ```
 sudo scripts/mini_witness_summary.sh
@@ -168,9 +241,10 @@ sudo scripts/mini_witness_summary.sh /var/log/chrony/refclocks.log --json
 ```
 
 Flags: `--mini-refid`, `--fuse-refid` (default `MINI`/`FUSE`),
-`--max-pair-gap-sec` (default 8 s, half the nominal poll interval, so a
-MINI sample never pairs with a FUSE sample from the adjacent poll cycle),
-`--gap-threshold-sec` (default 40 s), `--json`.
+`--max-pair-gap-sec` (default 8 s — a fixed cap comfortably inside one
+`poll 4` filter window, chosen to tolerate ordinary jitter between MINI's
+and FUSE's message arrivals without pairing across a real outage on
+either one), `--gap-threshold-sec` (default 40 s), `--json`.
 
 If a line doesn't split into exactly 9 fields, or its first two fields
 don't parse as a UTC date and time, the script refuses to guess and exits

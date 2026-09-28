@@ -17,6 +17,14 @@ Fixtures under `tests/fixtures/`:
                                  instead of silently mis-reading it.
   - refclocks_no_mini.log    -- FUSE-only, to prove a missing refid
                                  is reported clearly, not as zeros.
+  - refclocks_edge.log       -- pairing edge cases (a MINI sample too
+                                 far from any FUSE sample; one exactly
+                                 at --max-pair-gap-sec; one whose
+                                 nearest FUSE sample precedes it) plus
+                                 one filtered-format line (chronyd's
+                                 `-` placeholder columns) per refclock,
+                                 to prove filtered lines are excluded
+                                 from the raw-sample statistics.
 
 Expected statistics below are computed independently with `statistics`
 module from the same raw floats the fixture encodes (column 8, "Cooked
@@ -164,3 +172,78 @@ def test_missing_log_file_reported_clearly():
     proc = _run("does-not-exist.log")
     assert proc.returncode != 0
     assert "does-not-exist.log" in proc.stderr
+
+
+# --- Fix round 1, item 3: pairing edge cases --------------------------------
+#
+# refclocks_edge.log (all offsets in the "Cooked offset" column, seconds,
+# converted to ms below):
+#
+#   MINI@00:00:00.000000  1.500e-03   <-> nearest FUSE@00:00:00.000000  1.000e-03   gap 0.000s   PAIRED
+#   MINI@00:00:11.000000  5.000e-03   <-> nearest FUSE is 9s away (F@20s) / 11s away (F@0s), both > 8s   UNPAIRED
+#   MINI@00:00:28.000000  2.800e-03   <-> nearest FUSE@00:00:20.000000  2.000e-03   gap 8.000s   PAIRED (boundary, FUSE precedes MINI)
+#   MINI@00:00:39.000000  3.500e-03   <-> nearest FUSE@00:00:40.000000  3.000e-03   gap 1.000s   PAIRED (FUSE follows MINI)
+#
+# plus one filtered-format MINI line (99.000ms) and one filtered-format FUSE
+# line (-99.000ms) -- wildly-off-scale values that would be obvious if
+# wrongly counted.
+
+_EDGE_MINI_RAW_N = 4
+_EDGE_FUSE_RAW_N = 3
+_EDGE_DIFF_MS = [0.500, 0.800, 0.500]  # M@0s, M@28s, M@39s (M@11s excluded)
+
+
+def test_edge_fixture_filtered_lines_excluded_from_counts():
+    proc = _run("refclocks_edge.log", "--json")
+    assert proc.returncode == 0, proc.stderr
+    out = json.loads(proc.stdout)
+    # 5 MINI lines total in the fixture, one filtered -> 4 raw.
+    assert out["mini"]["n"] == _EDGE_MINI_RAW_N
+    # 4 FUSE lines total in the fixture, one filtered -> 3 raw.
+    assert out["fuse_rate"]["n"] == _EDGE_FUSE_RAW_N
+    assert out["mini_filtered_skipped"] == 1
+    assert out["fuse_filtered_skipped"] == 1
+    # The filtered samples' outlandish offsets (99ms / -99ms) must not
+    # leak into the raw mean.
+    assert out["mini"]["mean_ms"] < 10.0
+
+
+def test_edge_fixture_far_sample_is_unpaired_and_excluded_from_diff():
+    proc = _run("refclocks_edge.log", "--json")
+    assert proc.returncode == 0, proc.stderr
+    out = json.loads(proc.stdout)
+    diff = out["diff_mini_minus_fuse"]
+    assert diff["unpaired_mini"] == 1
+    assert diff["n"] == len(_EDGE_DIFF_MS)
+    expected = _stats_ms([v / 1000 for v in _EDGE_DIFF_MS])
+    assert diff["mean_ms"] == pytest.approx(expected["mean_ms"], abs=1e-9)
+    assert diff["median_ms"] == pytest.approx(expected["median_ms"], abs=1e-9)
+
+
+def test_edge_fixture_boundary_sample_at_exactly_max_gap_is_paired():
+    # MINI@00:00:28.000000 sits EXACTLY --max-pair-gap-sec (8.0s, the
+    # default) from its nearest FUSE sample (FUSE@00:00:20.000000), and
+    # that nearest FUSE sample PRECEDES it (exercises the bisect "i-1"
+    # candidate, not just "i"). Mutation: `>` -> `>=` in the pairing gap
+    # check would exclude this sample (unpaired_mini would read 2, not 1;
+    # diff n would read 2, not 3, and mean/median would shift since
+    # 0.800ms -- this sample's diff -- would drop out).
+    proc = _run("refclocks_edge.log", "--json", "--max-pair-gap-sec", "8.0")
+    assert proc.returncode == 0, proc.stderr
+    out = json.loads(proc.stdout)
+    diff = out["diff_mini_minus_fuse"]
+    assert diff["unpaired_mini"] == 1
+    assert diff["n"] == 3
+    expected = _stats_ms([v / 1000 for v in _EDGE_DIFF_MS])
+    assert diff["mean_ms"] == pytest.approx(expected["mean_ms"], abs=1e-9)
+
+
+def test_edge_fixture_tighter_pair_gap_excludes_the_boundary_sample():
+    # Same fixture, but with a pairing window just under 8.0s: the
+    # boundary MINI sample (gap exactly 8.000s) must now fall out too.
+    proc = _run("refclocks_edge.log", "--json", "--max-pair-gap-sec", "7.9")
+    assert proc.returncode == 0, proc.stderr
+    out = json.loads(proc.stdout)
+    diff = out["diff_mini_minus_fuse"]
+    assert diff["unpaired_mini"] == 2
+    assert diff["n"] == 2
