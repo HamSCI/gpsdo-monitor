@@ -53,23 +53,76 @@ refid before any statistic is computed. Merging happens by SAMPLE
 TIMESTAMP, not by argument or file order, so the two files can be
 passed in either order and produce the same result.
 
-SHORT-TAU STATISTIC (fix round, item I3): plain std and MAD, above, are
-computed over the WHOLE span of raw offsets, so a slow drift in the
-host clock (NTP wander) or in the sample set itself shows up as extra
-spread that has nothing to do with message-to-message jitter. The
-short-tau statistic answers a narrower question: how much does the
-offset move from ONE message to the next? For a white-noise process,
-the two-sample (Allan) deviation at tau = one message period equals
-the standard deviation of first differences between consecutive
-samples, divided by sqrt(2) (see e.g. W.J. Riley, "Handbook of
-Frequency Stability Analysis," NIST SP 1065, the standard reference
-for this formula). `_short_tau_stat()` implements exactly that:
+SHORT-TAU STATISTIC (item I3; formula + framing corrected in Round 2,
+item 6): plain std and MAD, above, are computed over the WHOLE span of
+raw offsets, so a slow drift in the host clock (NTP wander) or in the
+sample set itself shows up as extra spread that has nothing to do with
+message-to-message jitter. The short-tau statistic answers a narrower
+question: how much does the offset move from one sample to the next?
+
+The textbook two-sample deviation of a series x (sampled at spacing
+tau) is
+
+    sigma(tau) = sqrt( (1/2) * mean( (x[i+1] - x[i])^2 ) )
+
+-- the root-mean-square first difference, scaled by 1/sqrt(2), with NO
+mean subtracted. What `_short_tau_stat()` actually computes is
+
+    stdev(diffs) / sqrt(2)
+
+using Python's `statistics.stdev` (sample standard deviation, Bessel's
+correction, MEAN-SUBTRACTED). Subtracting the mean difference removes
+a constant drift (a steady frequency offset) from the estimate that
+the textbook formula above would NOT remove -- a deliberate choice
+here, not an oversight, but a different quantity from the textbook
+one, and worth naming as such rather than calling it "the" Allan
+deviation without qualification.
+
+This estimator equals the Allan deviation of x only IN EXPECTATION,
+for white noise -- it is an unbiased estimator of that quantity across
+many hypothetical repeats of the same measurement, not an exact
+computation of it from any one finite sample, and it says nothing
+about non-white noise (drift, flicker, etc.) beyond removing a
+constant term. It is also NOT Riley's phase-data AVAR (W.J. Riley,
+"Handbook of Frequency Stability Analysis," NIST SP 1065): that
+formula takes SECOND differences of phase/time data
+(`x[i+2] - 2*x[i+1] + x[i]`) to get a true frequency-noise Allan
+deviation; MINI's offsets are read here directly as the series being
+differenced ONCE, not twice, which is a different (simpler, and for
+this purpose adequate) computation. Riley remains the right reference
+for the general two-sample-deviation FAMILY of statistics; it is not a
+citation for this exact formula.
+
+`_short_tau_stat()` computes it from `_consecutive_diffs()`:
 consecutive raw samples whose time gap is <= `--gap-threshold-sec`
-(the same threshold that flags an outage) contribute one first
-difference each; the reported value is `stdev(differences) / sqrt(2)`.
-It needs at least 2 differences (3 samples) to report a value; fewer
-than that reports `n_diffs` honestly but leaves `value_ms` `None`
-rather than guessing from too little data.
+(the same threshold that flags an outage, default 40 s) each
+contribute one first difference. Tau is therefore NOT one fixed value
+-- it's whatever a given pair's spacing happens to be, anywhere from
+just over 0 s up to the gap threshold, since the Mini's message rate
+isn't perfectly regular and outages get excluded rather than bridged.
+`median_spacing_sec` in the output reports the median of the spacings
+actually used, so a reader can see what tau meant for THIS run rather
+than assuming "one message period." The statistic needs at least 2
+differences (3 samples, or 3 pairs for the MINI-FUSE series below) to
+report a value; fewer reports `n_diffs` honestly but leaves
+`value_ms` and `median_spacing_sec` `None` rather than guessing from
+too little data.
+
+MINI-FUSE short-tau uses its OWN pairing, `_pair_one_per_fuse()`, not
+the `diff_mini_minus_fuse` pairing above (Round 2, item 4).
+`_pair_nearest` pairs every MINI sample to its nearest FUSE sample --
+right for the aggregate statistics, where every MINI sample deserves
+an opinion, but wrong here: several consecutive MINI samples can share
+the SAME nearest FUSE sample, and a difference between two diffs built
+against one shared FUSE sample is really just the difference between
+two MINI offsets -- FUSE cancels out of it completely, and the result
+would silently report MINI's own short-tau mislabeled as MINI-FUSE.
+Pairing one point per FUSE sample instead (the nearest MINI sample to
+EACH FUSE sample) means every included difference spans two DISTINCT
+FUSE samples. When FUSE is polled less often than
+`--gap-threshold-sec`, this can honestly give too few consecutive
+pairs to report a value -- even `n_diffs: 0` -- and that's a correct
+answer about FUSE's own polling rate, not a bug.
 
 A result of a few milliseconds here cannot, on its own, tell the Mini's
 own timing apart from gpsdo-monitor's stamp noise: Python's GIL switch
@@ -294,30 +347,85 @@ def _pair_nearest(
     return paired, unpaired
 
 
-def _consecutive_diffs_ms(
+def _pair_one_per_fuse(
+    mini: list[Sample], fuse: list[Sample], max_gap_sec: float
+) -> list[tuple[datetime, float]]:
+    """One `(fuse_timestamp, diff_seconds)` pair per FUSE sample -- the
+    nearest MINI sample to it, within `max_gap_sec` -- so a
+    consecutive-difference series built from this list never reuses
+    the same FUSE sample twice in a row.
+
+    Round 2, item 4: `_pair_nearest` (above) pairs each MINI sample to
+    ITS nearest FUSE sample, which is right for the aggregate
+    diff_mini_minus_fuse statistics (every MINI sample gets an
+    opinion) but wrong for the short-tau series: several consecutive
+    MINI samples can share the SAME nearest FUSE sample, and a
+    difference between two diffs built against that one shared FUSE
+    sample is really just the difference between two MINI offsets --
+    FUSE cancels out of it completely, and the result silently reports
+    MINI's own short-tau mislabeled as MINI-FUSE. Pairing one point
+    per FUSE sample instead means every included difference spans two
+    DISTINCT FUSE samples. When FUSE is polled less often than
+    `--gap-threshold-sec`, this can honestly yield too few consecutive
+    pairs (even zero) to report a value -- see
+    docs/MINI_TIMING_WITNESS.md."""
+    if not mini:
+        return []
+    mini_ts = [s.ts for s in mini]
+    paired: list[tuple[datetime, float]] = []
+    for f in fuse:
+        i = bisect_left(mini_ts, f.ts)
+        candidates = [j for j in (i - 1, i) if 0 <= j < len(mini)]
+        if not candidates:
+            continue
+        best = min(candidates, key=lambda j: abs((mini_ts[j] - f.ts).total_seconds()))
+        gap = abs((mini_ts[best] - f.ts).total_seconds())
+        if gap > max_gap_sec:
+            continue
+        paired.append((f.ts, mini[best].offset_s - f.offset_s))
+    return paired
+
+
+def _consecutive_diffs(
     ordered: list[tuple[datetime, float]], max_gap_sec: float
-) -> list[float]:
-    """First differences (in ms) between consecutive `(timestamp,
-    value_ms)` pairs whose time gap is <= `max_gap_sec` -- `ordered`
-    must already be time-sorted. A pair spanning a real outage (gap >
-    `max_gap_sec`) contributes no difference: it isn't "one message
-    period apart" in the sense the short-tau statistic needs."""
-    diffs: list[float] = []
+) -> list[tuple[float, float]]:
+    """`(spacing_sec, diff_ms)` for each consecutive `(timestamp,
+    value_ms)` pair in `ordered` (already time-sorted) whose time gap
+    is <= `max_gap_sec`. A pair spanning a real outage (gap >
+    `max_gap_sec`) contributes nothing: at that spacing it isn't
+    "consecutive" in the sense the short-tau statistic needs. `tau`
+    for the statistic built from these is NOT one fixed value -- it's
+    whatever `spacing_sec` a given pair happens to have, anywhere from
+    just over 0 up to `max_gap_sec` -- see `_short_tau_stat`'s
+    `median_spacing_sec`."""
+    out: list[tuple[float, float]] = []
     for (t0, v0), (t1, v1) in zip(ordered, ordered[1:]):
-        if (t1 - t0).total_seconds() <= max_gap_sec:
-            diffs.append(v1 - v0)
-    return diffs
+        gap = (t1 - t0).total_seconds()
+        if gap <= max_gap_sec:
+            out.append((gap, v1 - v0))
+    return out
 
 
-def _short_tau_stat(diffs_ms: list[float]) -> dict:
-    """Two-sample (Allan-type) deviation at tau = one message period,
-    from first differences of consecutive raw samples -- see the
-    module docstring's "SHORT-TAU STATISTIC" note for the formula and
-    its citation. Needs >= 2 differences to take a stdev of; fewer
-    reports `n_diffs` honestly and leaves `value_ms` `None`."""
-    n = len(diffs_ms)
+def _short_tau_stat(diffs: list[tuple[float, float]]) -> dict:
+    """Two-sample deviation from first differences of consecutive raw
+    samples -- see the module docstring's "SHORT-TAU STATISTIC" note
+    for the exact formula, what it does and doesn't equal, and why.
+    `diffs` is `(spacing_sec, diff_ms)` per pair, from
+    `_consecutive_diffs`. Needs >= 2 differences to take a stdev of;
+    fewer reports `n_diffs` honestly and leaves `value_ms` (and
+    `median_spacing_sec`) `None` rather than guessing from too little
+    data."""
+    n = len(diffs)
+    if n == 0:
+        return {"n_diffs": 0, "value_ms": None, "median_spacing_sec": None}
+    spacings = [g for g, _ in diffs]
+    diffs_ms = [d for _, d in diffs]
     value = statistics.stdev(diffs_ms) / math.sqrt(2) if n >= 2 else None
-    return {"n_diffs": n, "value_ms": value}
+    return {
+        "n_diffs": n,
+        "value_ms": value,
+        "median_spacing_sec": statistics.median(spacings),
+    }
 
 
 def _fold_by_period(samples: list[Sample], period_sec: int) -> dict[str, dict]:
@@ -367,10 +475,15 @@ def summarize(
     diff_stats["unpaired_mini"] = unpaired
     diff_stats["max_pair_gap_sec"] = max_pair_gap_sec
 
-    mini_short_tau = _short_tau_stat(_consecutive_diffs_ms(
+    mini_short_tau = _short_tau_stat(_consecutive_diffs(
         [(s.ts, s.offset_s * 1000.0) for s in mini], gap_threshold_sec))
-    diff_short_tau = _short_tau_stat(_consecutive_diffs_ms(
-        [(t, d * 1000.0) for t, d in paired], gap_threshold_sec))
+    # The short-tau series uses ITS OWN pairing (one point per FUSE
+    # sample, not one per MINI sample) -- see _pair_one_per_fuse's
+    # docstring (Round 2, item 4) for why reusing `paired` here would
+    # silently cancel FUSE out of some of the differences.
+    fuse_paired = _pair_one_per_fuse(mini, fuse, max_pair_gap_sec)
+    diff_short_tau = _short_tau_stat(_consecutive_diffs(
+        [(t, d * 1000.0) for t, d in fuse_paired], gap_threshold_sec))
 
     return {
         "log_paths": [str(p) for p in paths],
@@ -421,13 +534,16 @@ def render_text(result: dict) -> str:
     st = result["mini_short_tau"]
     dst = result["diff_short_tau"]
     lines.append(
-        f"{result['mini_refid']} short-tau (tau = one message period, "
-        f"stdev(first differences)/sqrt(2), n diffs={st['n_diffs']}, "
-        f"gap <= {result['gap_threshold_sec']}s): {_fmt(st['value_ms'])} ms"
+        f"{result['mini_refid']} short-tau (stdev(first differences)/"
+        f"sqrt(2), n diffs={st['n_diffs']}, median spacing "
+        f"{_fmt(st['median_spacing_sec'], 's')}, tau in (0, "
+        f"{result['gap_threshold_sec']}]s): {_fmt(st['value_ms'])} ms"
     )
     lines.append(
         f"{result['mini_refid']} - {result['fuse_refid']} short-tau "
-        f"(n diffs={dst['n_diffs']}): {_fmt(dst['value_ms'])} ms"
+        f"(one pair per {result['fuse_refid']} sample; n diffs="
+        f"{dst['n_diffs']}, median spacing "
+        f"{_fmt(dst['median_spacing_sec'], 's')}): {_fmt(dst['value_ms'])} ms"
     )
     lines.append("")
 
