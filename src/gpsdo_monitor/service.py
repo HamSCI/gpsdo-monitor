@@ -146,6 +146,15 @@ class DeviceWorker:
     # One log line, not one per tick, when a second Mini finds the feed
     # already claimed.
     _chrony_shm_extra_logged: bool = False
+    # Round 2, item 3: set once _drop_mini has WARNED about a drop, so a
+    # device that re-enumerates every tick but never actually comes back
+    # healthy (open + start_reader "succeed," the very next probe fails)
+    # doesn't get a fresh WARNING every single tick -- self.mini is
+    # briefly non-None right before each such drop, so `_drop_mini`'s own
+    # `if m is None: return` guard alone does not catch this. Cleared by
+    # a successful build_report() probe, which is the "reader/probe
+    # recovers" signal that re-arms the next drop's WARNING.
+    _mini_drop_warned: bool = False
 
     # --- lifecycle ---------------------------------------------------
 
@@ -294,14 +303,25 @@ class DeviceWorker:
         A USB reset shorter than a probe tick keeps the worker (it is keyed
         by serial) but kills the fd, and the reader can never recover on a
         dead fd.  Dropping it lets the next tick open the device afresh,
-        which is what the per-tick open used to do by construction."""
+        which is what the per-tick open used to do by construction.
+
+        Transition only (Round 2, item 3): the first drop after a
+        healthy period logs a WARNING; a device that keeps
+        re-enumerating without ever actually working again (open +
+        start_reader succeed, the very next probe fails) drops on every
+        tick, and those repeats log at DEBUG instead.  See
+        `_mini_drop_warned`'s docstring for why `self.mini is None`
+        alone can't already tell the two cases apart, and
+        `build_report`'s reset of the flag on a successful probe."""
         m = self.mini
         if m is None:
             return
         self.mini = None
-        log.warning("%s %s: closing the HID handle (%s); the next probe "
-                    "reopens the device", self.candidate.model,
-                    self.candidate.serial, why)
+        log_fn = log.debug if self._mini_drop_warned else log.warning
+        log_fn("%s %s: closing the HID handle (%s); the next probe "
+              "reopens the device", self.candidate.model,
+              self.candidate.serial, why)
+        self._mini_drop_warned = True
         try:
             m.close()
         except OSError as e:
@@ -340,6 +360,10 @@ class DeviceWorker:
                 if m is not None:
                     self._drop_mini(f"probe failed: {e}")
                 raise
+            # A successful probe is the "reader/probe recovers" signal
+            # that re-arms _drop_mini's WARNING for the NEXT failure --
+            # see _mini_drop_warned.
+            self._mini_drop_warned = False
             # MON-VER is slow (several hundred ms) and the answer never
             # changes, so we try once and cache. Subsequent ticks reuse
             # the cached string.

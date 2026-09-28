@@ -9,6 +9,7 @@ atomic_write of /run/gpsdo/<serial>.json, and the index file.
 from __future__ import annotations
 
 import json
+import logging
 import threading
 import time
 from pathlib import Path
@@ -548,6 +549,88 @@ def test_a_reader_that_gave_up_is_replaced_on_the_next_tick(mini_worker):
         w.build_report(host="h", now=time.time())
         assert w.hid.closed, "the dead handle must be closed"
         assert w.mini is not first and len(w.opened) == 2
+    finally:
+        w.stop()
+
+
+def test_drop_mini_warns_once_then_quiets_until_a_successful_probe(
+    mini_worker, monkeypatch, caplog,
+):
+    """Round 2, item 3: `_drop_mini` must log its WARNING on the
+    transition only -- the first drop after a healthy period -- and
+    stay quiet (debug) on repeats until a successful probe resets it.
+
+    A device that re-enumerates on every USB reset but never actually
+    comes back healthy makes `_start_ubx_reader` "succeed" (a fresh
+    handle opens, the reader starts) on every tick, immediately
+    followed by a failing `get_status()` -- so `self.mini` is briefly
+    non-None right before every single drop. Without a persistent
+    transition flag, `_drop_mini`'s existing `if m is None: return`
+    guard does nothing to silence this, and every failing tick would
+    log its own WARNING."""
+    from gpsdo_monitor import service as svc_mod
+    from gpsdo_monitor.models.lbe_mini import LbeMini
+    from tests.test_mini import _StreamFakeHid, _feature, _pvt_frames
+
+    w = mini_worker
+    w.start()
+    try:
+        w.hid.release()
+        assert _wait(lambda: w.mini.nav_pvt_count() >= 1)
+        # A healthy probe first -- the healthy period the transition is
+        # measured from.
+        assert w.build_report(host="h", now=time.time()) is not None
+
+        def _open_broken(_cand):
+            h = _StreamFakeHid(_feature(), _pvt_frames())
+            h.broken_feature = True
+            h.release()
+            return LbeMini(h)
+
+        monkeypatch.setattr(svc_mod, "open_model", _open_broken)
+        w.hid.broken_feature = True   # kill the currently-open handle too
+
+        logger_name = "gpsdo_monitor.service"
+        with caplog.at_level(logging.WARNING, logger=logger_name):
+            for _ in range(4):
+                with pytest.raises(OSError):
+                    w.build_report(host="h", now=time.time())
+        drop_warnings = [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING
+            and "closing the HID handle" in r.getMessage()
+        ]
+        assert len(drop_warnings) == 1, (
+            f"expected exactly one WARNING across 4 consecutive failing "
+            f"ticks, got {len(drop_warnings)}")
+
+        # Recovery: the next reopen hands back a HEALTHY handle, so the
+        # probe succeeds -- this must reset the transition flag.
+        def _open_healthy(_cand):
+            h = _StreamFakeHid(_feature(), _pvt_frames())
+            h.release()
+            return LbeMini(h)
+
+        monkeypatch.setattr(svc_mod, "open_model", _open_healthy)
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger=logger_name):
+            report = w.build_report(host="h", now=time.time())
+        assert report is not None
+        assert not [r for r in caplog.records if r.levelno == logging.WARNING]
+
+        # A FRESH failure after the recovery warns again -- proving the
+        # flag actually reset, not just "warn once, ever."
+        w.mini.hid.broken_feature = True
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger=logger_name):
+            with pytest.raises(OSError):
+                w.build_report(host="h", now=time.time())
+        drop_warnings2 = [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING
+            and "closing the HID handle" in r.getMessage()
+        ]
+        assert len(drop_warnings2) == 1
     finally:
         w.stop()
 
