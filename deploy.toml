@@ -24,3 +24,14 @@ kind             = "infra"
 units = [
     "gpsdo-monitor.service",
 ]
+
+# The config this client needs, declared the contract way (kind = "render").
+# install.sh's install_config() copies the same file when /etc/gpsdo-monitor/
+# config.toml is absent; this entry names it so sigmond can judge `configured`
+# and ops' site-capture can record how a site's copy differs from the default.
+[[install.steps]]
+kind      = "render"
+src       = "deploy/config.example.toml"
+dst       = "/etc/gpsdo-monitor/config.toml"
+mode      = "0644"
+if_absent = true
