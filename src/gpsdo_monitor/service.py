@@ -40,12 +40,11 @@ from gpsdo_monitor.advisories import lookup_protver
 from gpsdo_monitor.chrony_shm import ChronyShmFeed, RESERVED_SHM_UNITS
 from gpsdo_monitor.config import Config, DeclaredDevice
 from gpsdo_monitor.discovery import DiscoveryResult, match
-from gpsdo_monitor.health import classify
+from gpsdo_monitor.health import classify, fill_grid
 from gpsdo_monitor.hid_xport import HidCandidate
 from gpsdo_monitor.models import REGISTRY, open_model
 from gpsdo_monitor.models.lbe_mini import LbeMini
-from gpsdo_monitor.nmea import (NmeaReader, find_ttys_by_usb_serial,
-                                to_maidenhead)
+from gpsdo_monitor.nmea import NmeaReader, find_ttys_by_usb_serial
 from gpsdo_monitor.pps import PpsTracker
 from gpsdo_monitor.publish import Advertiser
 from gpsdo_monitor.schema import (
@@ -437,12 +436,10 @@ class DeviceWorker:
                 raw.health.grid = grid
 
         # The grid is what bring-up actually consumes to place the station,
-        # so derive it from whatever position arrived — NMEA or UBX.
-        if (raw.health.grid is None
-                and raw.health.latitude is not None
-                and raw.health.longitude is not None):
-            raw.health.grid = to_maidenhead(raw.health.latitude,
-                                            raw.health.longitude)
+        # so derive it from whatever position arrived — NMEA or UBX.  Shared
+        # with the one-shot `status` path: they disagreed before, and the CLI
+        # was the one sigmond's wizard asked.
+        fill_grid(raw.health)
 
         # PPS study: snapshot the rolling window. If tracker isn't
         # running (no CDC, or device config disabled it) fall back to a

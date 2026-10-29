@@ -71,3 +71,50 @@ def classify(
         bits.append("pps_present")
     bits.append("fresh")
     return "A1", " && ".join(bits)
+
+
+# ── position → grid ─────────────────────────────────────────────────────────
+# ⛔ ONE copy of this rule.  `serve` carried its own inline version and the
+# one-shot `status` path carried none, so the same device reported a grid from
+# the daemon and "grid": null from the CLI -- which is how an LBE-Mini holding
+# a 3D fix on 12 satellites came to tell sigmond's first-boot wizard it had no
+# position, and an operator typed a locator the hardware was holding
+# (AI6VN, 2026-10-29).
+#
+# ⛔ The guard lives HERE, not in to_maidenhead, which CLAMPS its input by
+# design and has callers that want that.  Clamping turns an unset 0.0/0.0 into
+# "JJ00aa" -- a locator that looks perfectly real, in the Gulf of Guinea.
+
+_NO_FIX = ("", "no_fix", "none")
+
+
+def _is_coord(v: object) -> bool:
+    """A real number, and not a bool -- bool is a subclass of int."""
+    return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+
+def fill_grid(health: Health) -> None:
+    """Derive `health.grid` from the fix position, in place.
+
+    No-op when the device already named a grid (NMEA models do), when there is
+    no usable fix behind the coordinates, or when the coordinates cannot be a
+    position.  A station placed from a stale or zeroed position is worse than
+    one placed by hand, because nothing downstream can tell it was guessed.
+    """
+    if health.grid:
+        return
+    lat, lon = health.latitude, health.longitude
+    if not (_is_coord(lat) and _is_coord(lon)):
+        return
+    fixed = bool(health.gps_locked) or (
+        isinstance(health.gps_fix, str)
+        and health.gps_fix.lower() not in _NO_FIX
+    )
+    if not fixed:
+        return
+    if not (-90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0):
+        return
+    if lat == 0.0 and lon == 0.0:
+        return
+    from gpsdo_monitor.nmea import to_maidenhead
+    health.grid = to_maidenhead(lat, lon)

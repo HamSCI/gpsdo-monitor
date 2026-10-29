@@ -16,6 +16,7 @@ from pathlib import Path
 from gpsdo_monitor import __version__
 from gpsdo_monitor.config import Config
 from gpsdo_monitor.discovery import match
+from gpsdo_monitor.health import fill_grid
 from gpsdo_monitor.hid_xport import enumerate_lbe
 from gpsdo_monitor.models import open_model
 from gpsdo_monitor.schema import NAV_CLOCK_NOTE, PpsStudy, utc_now_iso
@@ -58,6 +59,11 @@ def _cmd_status(args: argparse.Namespace) -> int:
                     pps_study = _sample_pps(candidate.serial, args.pps_sample_sec)
                 if model.capabilities.has_ubx_mon_ver:
                     advisory = _enrich_firmware(model, raw)
+                # ⛔ AFTER every enrichment, and on EVERY model.  The Mini has
+                # no NMEA CDC, so _enrich_with_nmea -- which used to be the
+                # only thing that set a grid here -- never runs for it, and
+                # `status` reported "grid": null beside a valid UBX position.
+                fill_grid(raw.health)
         except NotImplementedError as e:
             print(f"{candidate.model}  {candidate.serial}: {e}", file=sys.stderr)
             continue
