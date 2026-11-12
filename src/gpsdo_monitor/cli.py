@@ -17,7 +17,7 @@ from gpsdo_monitor import __version__
 from gpsdo_monitor.config import Config
 from gpsdo_monitor.discovery import match
 from gpsdo_monitor.health import fill_grid
-from gpsdo_monitor.hid_xport import enumerate_lbe
+from gpsdo_monitor.hid_xport import enumerate_lbe, enumerate_unsupported_lbe
 from gpsdo_monitor.models import open_model
 from gpsdo_monitor.schema import NAV_CLOCK_NOTE, PpsStudy, utc_now_iso
 
@@ -31,8 +31,12 @@ def _setup_logging(verbose: bool) -> None:
 
 def _cmd_detect(_args: argparse.Namespace) -> int:
     present = enumerate_lbe()
+    for c in enumerate_unsupported_lbe():
+        what = f" ({c.product})" if c.product else ""
+        print(f"Leo Bodnar {c.vid:04x}:{c.pid:04x}{what} serial={c.serial!r} "
+              "recognised but not supported by gpsdo-monitor", file=sys.stderr)
     if not present:
-        print("no Leo Bodnar devices found", file=sys.stderr)
+        print("no supported Leo Bodnar devices found", file=sys.stderr)
         return 1
     for c in present:
         print(f"{c.model:10s}  pid={c.pid:#06x}  serial={c.serial!r:24s}  path={c.path.decode(errors='replace')}")
@@ -162,11 +166,20 @@ def _cmd_inventory(_args: argparse.Namespace) -> int:
         present: bool | None = bool(enumerate_lbe())
     except Exception:                                  # noqa: BLE001
         present = None
+    # A Leo Bodnar with no driver here is NOT "hardware present": sigmond
+    # enables gpsdo-monitor on that flag, and it could not drive the device.
+    # Named separately so sigmond can say why (KJ6MKI's 1dd2:2210).
+    try:
+        unsupported = [f"{c.vid:04x}:{c.pid:04x}:{c.serial}"
+                       for c in enumerate_unsupported_lbe()]
+    except Exception:                                  # noqa: BLE001
+        unsupported = []
     payload = {
         "client":           "gpsdo-monitor",
         "version":          __version__,
         "contract_version": "0.8",
         "hardware_present": present,
+        "unsupported_present": unsupported,
     }
     print(json.dumps(payload, indent=2))
     return 0

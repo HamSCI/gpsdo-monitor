@@ -75,6 +75,28 @@ def enumerate_lbe() -> list[HidCandidate]:
     return out
 
 
+def enumerate_unsupported_lbe() -> list[HidCandidate]:
+    """Leo Bodnar HID devices whose PID has no driver here (PIDS).
+
+    Recognised as Leo Bodnar (vendor 1dd2) but not driven: e.g. the original
+    dual-output "GPS Reference Clock", 1dd2:2210 (KJ6MKI, 2026-11-12), which
+    used to make `detect` say "no Leo Bodnar devices found" while lsusb
+    listed it.  Its protocol is not implemented, and is not guessed at."""
+    out: list[HidCandidate] = []
+    for d in hid.enumerate(VID_LBE, 0):
+        if d["product_id"] in PIDS:
+            continue
+        out.append(HidCandidate(
+            path=d["path"],
+            vid=d["vendor_id"],
+            pid=d["product_id"],
+            serial=d.get("serial_number") or "",
+            product=d.get("product_string") or "",
+            manufacturer=d.get("manufacturer_string") or "",
+        ))
+    return out
+
+
 class HidDevice:
     """Owned HID handle.
 
@@ -155,6 +177,7 @@ __all__ = [
     "REPORT_SIZE",
     "VID_LBE",
     "PIDS",
+    "enumerate_unsupported_lbe",
     "HidCandidate",
     "HidDevice",
     "enumerate_lbe",

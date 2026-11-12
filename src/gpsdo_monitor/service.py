@@ -104,6 +104,24 @@ def _build_chrony_feed(cfg: Config) -> Optional[ChronyShmFeed]:
 # --- Per-device worker --------------------------------------------------
 
 
+def _hostname() -> str:
+    """This host's name as configured, never a reverse lookup: getfqdn()
+    answered "ip6-localhost" from /etc/hosts' ::1 line on KJ6MKI
+    (2026-11-12), and index.json carried that instead of the station."""
+    return socket.gethostname() or "unknown"
+
+
+def _unsupported_entries() -> list[dict]:
+    """index.json's `unsupported` list; [] when enumeration fails."""
+    from gpsdo_monitor.hid_xport import enumerate_unsupported_lbe
+    try:
+        found = enumerate_unsupported_lbe()
+    except Exception:                                  # noqa: BLE001
+        return []
+    return [{"vid": f"{c.vid:04x}", "pid": f"{c.pid:04x}",
+             "serial": c.serial, "product": c.product} for c in found]
+
+
 @dataclass
 class DeviceWorker:
     """Owns the long-lived threads and caches for one physical device.
@@ -745,7 +763,7 @@ class Service:
     # --- reports -------------------------------------------------------
 
     def _write_reports(self, result: DiscoveryResult) -> dict[str, DeviceReport]:
-        host = socket.getfqdn() or socket.gethostname()
+        host = _hostname()
         now = time.time()
         out: dict[str, DeviceReport] = {}
         for declared, candidate in result.matched:
@@ -789,7 +807,7 @@ class Service:
         result: DiscoveryResult,
         reports: dict[str, DeviceReport],
     ) -> None:
-        host = socket.getfqdn() or socket.gethostname()
+        host = _hostname()
         entries: list[IndexEntry] = []
         for declared, candidate in result.matched:
             key = self._key(candidate)
@@ -807,6 +825,7 @@ class Service:
             written_utc=utc_now_iso(),
             host=host,
             devices=entries,
+            unsupported=_unsupported_entries(),
         )
         atomic_write(str(self.cfg.run_dir / "index.json"), idx.to_json())
 

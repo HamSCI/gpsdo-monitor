@@ -180,6 +180,11 @@ class IndexFile:
     written_utc: str
     host: str
     devices: list[IndexEntry] = field(default_factory=list)
+    # Leo Bodnar devices present on USB that gpsdo-monitor has no driver for
+    # ({"vid", "pid", "serial", "product"}): additive, so a reader keyed on
+    # `devices` is unchanged, and sigmond can say "unsupported model" rather
+    # than "not detected" (KJ6MKI's 1dd2:2210, 2026-11-12).
+    unsupported: list[dict] = field(default_factory=list)
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), indent=2, sort_keys=False)
