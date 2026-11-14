@@ -32,12 +32,15 @@ class FakeMvr:
     characters, takes CR-terminated selections, and closes on 99."""
 
     def __init__(self, *, passthrough=False, boot=False, clk1="off",
-                 silent=False, no_exit_line=False, pending=""):
+                 silent=False, no_exit_line=False, pending="", exit_text=None,
+                 after_exit=""):
         self.passthrough = passthrough
         self.boot = boot
         self.clk1 = clk1
         self.silent = silent
         self.no_exit_line = no_exit_line
+        self.exit_text = exit_text      # firmware wording/line ending as seen on hardware
+        self.after_exit = after_exit    # what the device prints once the menu closes
         self.menu_open = False
         self.awaiting_persist = False
         self.line = ""
@@ -95,10 +98,13 @@ class FakeMvr:
             self.awaiting_persist = True
         elif sel == "99":
             self.menu_open = False
-            if not self.no_exit_line:
+            if self.exit_text is not None:
+                self._emit(self.exit_text)
+            elif not self.no_exit_line:
                 self._emit("Exiting menu, resuming NMEA passthrough.\r\n"
                            if self.passthrough else
                            "Exiting menu, back to normal status output.\r\n")
+            self._emit(self.after_exit)
         else:
             self._emit("Not a valid option.\r\n" + self._header())
 
@@ -145,6 +151,27 @@ def test_probe_times_out_cleanly_and_sends_nothing_more():
 def test_probe_reports_a_missing_exit_line():
     dev = FakeMvr(no_exit_line=True)
     with pytest.raises(MvrTimeout):
+        _console(dev, timeout=0.2).probe()
+    assert dev.written == [b"\r", b"99\r"]
+
+
+# N8UR, 2026-11-14: the first live probe sent 99 and then saw no complete "Exiting menu" line
+# within 5 s.  The menu closing is now recognised by any of three signs, and a failure says what came back.
+@pytest.mark.parametrize("exit_text,after", [
+    ("Exiting menu, back to normal status output.\r", ""),            # bare CR
+    ("Menu timed out, back to normal status output.\r\n", ""),       # the timeout wording
+    ("", "[110130] GPS: DGPS fix, 12 sats | Loop: LOCKED | CLK0 27000000Hz CLK1 27000000Hz CLK2 off\r\n"),
+])
+def test_probe_recognises_the_menu_closing(exit_text, after):
+    dev = FakeMvr(clk1="27000000 Hz", exit_text=exit_text, after_exit=after)
+    info = _console(dev).probe()
+    assert dev.written == [b"\r", b"99\r"]
+    assert info.complete and info.exit_line
+
+
+def test_a_missing_exit_line_reports_what_came_back():
+    dev = FakeMvr(no_exit_line=True)
+    with pytest.raises(MvrTimeout, match="received after 99"):
         _console(dev, timeout=0.2).probe()
     assert dev.written == [b"\r", b"99\r"]
 

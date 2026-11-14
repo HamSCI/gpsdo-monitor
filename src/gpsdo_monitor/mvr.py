@@ -952,20 +952,24 @@ class MvrConsole:
             apply_menu_line(info, ln)
         return info
 
+    # The menu has closed when, after 99, the device prints its exit line (ended by CR or LF:
+    # N8UR's firmware did not end it as the notes imply, 2026-11-14), its timeout line, or a
+    # fresh status line.
+    _CLOSED_RE = re.compile(r"(Exiting menu[^\r\n]*|Menu timed out[^\r\n]*|\[\d+\] GPS:[^\r\n]*)[\r\n]")
+
     def _exit_menu(self) -> str:
-        """Send 99 and return the whole "Exiting menu, ..." line."""
-        self._send(b"99\r")
-        marker = "Exiting menu"
+        """Send 99 and return the line that shows the menu closed."""
+        self._send(b"99\r")          # clears _buf: it now holds only what follows 99
         deadline = time.monotonic() + self.timeout_sec
         while True:
-            at = self._buf.find(marker)
-            if at >= 0 and "\n" in self._buf[at:]:
-                return self._buf[at:].split("\n")[0].strip()
+            m = self._CLOSED_RE.search(self._buf)
+            if m:
+                return m.group(1).strip()
             left = deadline - time.monotonic()
             if left <= 0:
-                raise MvrTimeout(f"no complete {marker!r} line within "
-                                 f"{self.timeout_sec:.0f} s (the menu closes "
-                                 "itself after 30 s idle)")
+                raise MvrTimeout(f"no line showing the menu closed within "
+                                 f"{self.timeout_sec:.0f} s (the menu closes itself after "
+                                 f"30 s idle); received after 99: {self._buf[-300:]!r}")
             chunk = self.port.read(min(left, 0.1))
             if chunk:
                 self._buf += chunk.decode("ascii", errors="replace")
