@@ -29,7 +29,7 @@ def _setup_logging(verbose: bool) -> None:
     )
 
 
-def _cmd_detect(_args: argparse.Namespace) -> int:
+def _cmd_detect(args: argparse.Namespace) -> int:
     present = enumerate_lbe()
     for c in enumerate_unsupported_lbe():
         what = f" ({c.product})" if c.product else ""
@@ -37,10 +37,120 @@ def _cmd_detect(_args: argparse.Namespace) -> int:
               "recognised but not supported by gpsdo-monitor", file=sys.stderr)
     if not present:
         print("no supported Leo Bodnar devices found", file=sys.stderr)
-        return 1
     for c in present:
         print(f"{c.model:10s}  pid={c.pid:#06x}  serial={c.serial!r:24s}  path={c.path.decode(errors='replace')}")
-    return 0
+    mvrs = _detect_mvrs(getattr(args, "mvr_listen_sec", None))
+    return 0 if (present or mvrs) else 1
+
+
+def _detect_mvrs(listen_sec: float | None) -> int:
+    """List RP2040 CDC ttys, confirming each as an MVR by listening (never
+    writing) for up to `listen_sec`.  Returns how many were confirmed.
+    Costs nothing on a host with no RP2040 attached."""
+    from gpsdo_monitor import mvr
+    if listen_sec is None:
+        listen_sec = mvr.CONFIRM_WINDOW_SEC
+    found = 0
+    for c in mvr.enumerate_rp2040_ttys():
+        head = f"{c.vid:04x}:{c.pid:04x} {c.product or 'RP2040'} serial={c.serial!r} tty={c.tty}"
+        if listen_sec <= 0:
+            print(f"{head}: not checked for MVR content (--mvr-listen-sec 0)", file=sys.stderr)
+            continue
+        print(f"{head}: listening up to {listen_sec:.0f} s for MVR output ...", file=sys.stderr)
+        try:
+            st = mvr.passive_listen(c.tty, window_sec=listen_sec)
+        except mvr.PortBusy:
+            print(f"{head}: held by another process -- a running gpsdo-monitor "
+                  "service publishes it in /run/gpsdo", file=sys.stderr)
+            continue
+        except OSError as e:
+            print(f"{head}: cannot open: {e}", file=sys.stderr)
+            continue
+        if st.evidence is None:
+            print(f"{head}: no MVR output in {listen_sec:.0f} s; not an MVR", file=sys.stderr)
+            continue
+        found += 1
+        fw = f"  firmware={st.firmware}" if st.firmware else ""
+        print(f"{mvr.MODEL_NAME}  serial={c.serial!r:24s}  path={c.tty}{fw}")
+    return found
+
+
+def _mvr_service_active() -> bool:
+    """True when systemd says gpsdo-monitor.service is running."""
+    import subprocess
+    try:
+        return subprocess.run(
+            ["systemctl", "is-active", "--quiet", "gpsdo-monitor.service"],
+            check=False, timeout=5).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def _cmd_mvr(args: argparse.Namespace) -> int:
+    """`mvr probe` / `mvr passthrough on|off [--persist]`: the only code that
+    writes to an MVR.  Refuses while the service runs or anyone holds the
+    port, listens passively for MVR output before sending a byte, then sends
+    only the documented sequence (see mvr.ALLOWED_WRITES)."""
+    from gpsdo_monitor import mvr
+    if _mvr_service_active():
+        print("refusing: the gpsdo-monitor service is running and owns the MVR's "
+              "port.  Stop it first (sudo systemctl stop gpsdo-monitor), then "
+              "start it again afterwards.", file=sys.stderr)
+        return 2
+    tty = args.tty
+    if tty is None:
+        cands = mvr.enumerate_rp2040_ttys()
+        if len(cands) != 1:
+            which = ", ".join(c.tty for c in cands) or "none"
+            print(f"found {len(cands)} RP2040 CDC ttys ({which}); name one with --tty",
+                  file=sys.stderr)
+            return 2
+        tty = cands[0].tty
+    try:
+        fd, orig = mvr.open_port(tty, write=True)
+    except mvr.PortBusy:
+        print(f"refusing: {tty} is held by another process (the gpsdo-monitor "
+              "service, or another console)", file=sys.stderr)
+        return 2
+    except OSError as e:
+        print(f"{tty}: cannot open: {e}", file=sys.stderr)
+        return 1
+    confirmed = False
+    try:
+        print(f"{tty}: listening up to {args.listen_sec:.0f} s for MVR output "
+              "before sending anything ...", file=sys.stderr)
+        st = mvr.listen_on_fd(fd, window_sec=args.listen_sec)
+        if st.evidence is None:
+            print(f"{tty}: no MVR output in {args.listen_sec:.0f} s; sent nothing",
+                  file=sys.stderr)
+            return 1
+        confirmed = True
+        console = mvr.MvrConsole(mvr.TtyPort(fd), timeout_sec=args.timeout)
+        if args.mvr_command == "probe":
+            info = console.probe()
+            out = {
+                "tty": tty, "firmware": info.firmware, "built": info.built,
+                "clk0_hz": info.clk_hz[0], "clk1_hz": info.clk_hz[1],
+                "clk2_hz": info.clk_hz[2], "drive_ma": info.drive_ma,
+                "passthrough": info.passthrough,
+                "passthrough_boot_default": info.passthrough_boot,
+                "exit": info.exit_line,
+            }
+        else:
+            res = console.set_passthrough(args.state == "on", persist=args.persist)
+            out = {
+                "tty": tty, "passthrough": res.passthrough,
+                "passthrough_boot_default": res.passthrough_boot,
+                "changed": res.changed, "exit": res.exit_line,
+            }
+        print(json.dumps(out, indent=2))
+        return 0
+    except (mvr.MvrConsoleError, OSError) as e:
+        print(f"{tty}: {e}", file=sys.stderr)
+        return 1
+    finally:
+        # A confirmed MVR stays raw: the next naive open must not echo.
+        mvr._restore_and_close(fd, None if confirmed else orig)
 
 
 def _cmd_status(args: argparse.Namespace) -> int:
@@ -292,7 +402,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub = p.add_subparsers(dest="command", required=True)
 
-    sp = sub.add_parser("detect", help="enumerate attached Leo Bodnar devices")
+    sp = sub.add_parser("detect", help="enumerate attached Leo Bodnar and MVR devices")
+    sp.add_argument(
+        "--mvr-listen-sec", type=float, default=None,
+        help="seconds to listen (read-only) on each RP2040 tty for MVR output "
+             "(default 65; 0 skips the check)",
+    )
     sp.set_defaults(func=_cmd_detect)
 
     sp = sub.add_parser("status", help="one-shot health + output dump, JSON per device")
@@ -335,6 +450,35 @@ def build_parser() -> argparse.ArgumentParser:
                     help="drive strength (LBE-Mini accepts 8, 16, 24 or 32)")
     sp.add_argument("--serial", help="restrict to one device by serial")
     sp.set_defaults(func=_cmd_set_drive)
+
+    sp = sub.add_parser(
+        "mvr", help="MVR GPSDO B console commands (stop the service first)",
+        description=(
+            "Explicit commands that WRITE to an MVR GPSDO B's console.  The "
+            "service never does; these refuse while it runs.  Each listens "
+            "read-only for MVR output first, then sends one CR to wake the "
+            "menu and a selection only after the prompt."),
+    )
+    msub = sp.add_subparsers(dest="mvr_command", required=True)
+
+    def _mvr_common(q: argparse.ArgumentParser) -> None:
+        q.add_argument("--tty", help="the MVR's tty (default: the one RP2040 CDC tty)")
+        q.add_argument("--listen-sec", type=float, default=65.0,
+                       help="seconds to listen for MVR output before sending (default 65)")
+        q.add_argument("--timeout", type=float, default=5.0,
+                       help="seconds to wait for each menu response (default 5)")
+
+    q = msub.add_parser("probe", help="read firmware, CLK0..2, drive and passthrough "
+                                      "from the menu header, then exit the menu")
+    _mvr_common(q)
+    q.set_defaults(func=_cmd_mvr)
+    q = msub.add_parser("passthrough", help="turn NMEA passthrough on or off "
+                                            "(position exists only in passthrough)")
+    q.add_argument("state", choices=("on", "off"))
+    q.add_argument("--persist", action="store_true",
+                   help="also make it the power-on default")
+    _mvr_common(q)
+    q.set_defaults(func=_cmd_mvr)
 
     sp = sub.add_parser("config", help="configure a device (placeholder; use `smd gpsdo config`)")
     sp.set_defaults(func=_cmd_config)

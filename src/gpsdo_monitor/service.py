@@ -13,6 +13,10 @@ One `DeviceWorker` per matched device owns:
     interrupt-IN stream (see LbeMini.start_reader), so NAV-PVT and
     NAV-CLOCK are read continuously rather than 3 s out of every 10 s.
 
+An MVR GPSDO B (serial-only; see mvr.py) gets an `MvrWorker` instead: the
+`MvrProber` keeps one passive, read-only reader per RP2040 tty, confirms
+MVRs from their output, and hands confirmed ones to discovery.
+
 Each probe tick the `Service` calls `worker.build_report(host)`, which
 assembles a schema-v1 `DeviceReport` from the HID bitmap, the NMEA
 snapshot, the PPS rolling window, and the cached firmware, then writes
@@ -44,6 +48,8 @@ from gpsdo_monitor.health import classify, fill_grid
 from gpsdo_monitor.hid_xport import HidCandidate
 from gpsdo_monitor.models import REGISTRY, open_model
 from gpsdo_monitor.models.lbe_mini import LbeMini
+from gpsdo_monitor.mvr import MvrCandidate, MvrProber
+from gpsdo_monitor.mvr import build_report as build_mvr_report
 from gpsdo_monitor.nmea import NmeaReader, find_ttys_by_usb_serial
 from gpsdo_monitor.pps import PpsTracker
 from gpsdo_monitor.publish import Advertiser
@@ -344,6 +350,10 @@ class DeviceWorker:
         except OSError as e:
             log.debug("closing a dead Mini handle: %s", e)
 
+    def path_changed(self, why: str) -> None:
+        """Same serial, new node: the handle on the old path is dead."""
+        self._drop_mini(why)
+
     def stop(self) -> None:
         m, self.mini = self.mini, None
         if m is not None:
@@ -593,6 +603,48 @@ class DeviceWorker:
         return new_report
 
 
+@dataclass
+class MvrWorker:
+    """The worker for one MVR GPSDO B (serial-only; see mvr.py).
+
+    Same interface the Service drives on a DeviceWorker -- start, stop,
+    path_changed, build_report, refresh_fast -- but nothing here opens the
+    device.  The MvrProber's passive reader owns the port (it was already
+    listening to confirm the MVR); this worker reads its snapshot.  Never
+    touches the HID model layer, so _assert_drive's Mini-sized drive
+    correction cannot reach a device whose maximum is 8 mA."""
+
+    candidate: MvrCandidate
+    declared: DeclaredDevice
+    cfg: Config
+    prober: MvrProber
+    last_report: Optional[DeviceReport] = None
+
+    def start(self) -> None:
+        pass
+
+    def stop(self) -> None:
+        pass            # the prober owns the reader and closes it
+
+    def path_changed(self, why: str) -> None:
+        pass            # reader_for() follows the candidate each tick
+
+    def build_report(self, *, host: str, now: float) -> Optional[DeviceReport]:
+        reader = self.prober.reader_for(self.candidate)
+        if reader is None:
+            return None
+        report = build_mvr_report(
+            reader.snapshot(), candidate=self.candidate, declared=self.declared,
+            cfg=self.cfg, host=host, now_mono=time.monotonic(), now_wall=now)
+        if report is not None:
+            self.last_report = report
+        return report
+
+    def refresh_fast(self, *, now: float) -> Optional[DeviceReport]:
+        host = self.last_report.host if self.last_report is not None else _hostname()
+        return self.build_report(host=host, now=now)
+
+
 # --- Service ------------------------------------------------------------
 
 
@@ -617,6 +669,8 @@ class Service:
         # Last discovery error set, so _tick can log transitions only.
         self._last_errors: tuple[str, ...] = ()
         self._fast_nmea_thread: Optional[threading.Thread] = None
+        # Passive listeners on RP2040 CDC ttys; confirmed MVRs join discovery.
+        self._mvr = MvrProber()
 
     # --- lifecycle -----------------------------------------------------
 
@@ -655,6 +709,7 @@ class Service:
         if self.chrony_feed is not None:
             self.chrony_feed.close()
             self.chrony_feed = None
+        self._mvr.stop()
 
     def _fast_nmea_loop(self) -> None:
         """Background thread that republishes per-device JSON every
@@ -700,7 +755,8 @@ class Service:
         return 0
 
     def _tick(self) -> None:
-        result = match(self.cfg.devices)
+        mvrs = self._mvr.scan()
+        result = match(self.cfg.devices, mvrs) if mvrs else match(self.cfg.devices)
         # Log discovery errors on CHANGE, not once per tick.  A decoder VM
         # with no GPSDO passed through is the normal state of a fresh
         # install — install.sh enables the unit unconditionally even though
@@ -747,17 +803,21 @@ class Service:
                              w.candidate.path.decode(errors="replace"),
                              candidate.path.decode(errors="replace"))
                     w.candidate = candidate
-                    w._drop_mini("device path changed")
+                    w.path_changed("device path changed")
                 continue
             log.info("device %s %s appeared; starting worker",
                      candidate.model, key)
-            w = DeviceWorker(candidate=candidate, declared=declared, cfg=self.cfg,
-                             chrony_feed=self.chrony_feed)
+            if isinstance(candidate, MvrCandidate):
+                w = MvrWorker(candidate=candidate, declared=declared, cfg=self.cfg,
+                              prober=self._mvr)
+            else:
+                w = DeviceWorker(candidate=candidate, declared=declared, cfg=self.cfg,
+                                 chrony_feed=self.chrony_feed)
             w.start()
             self._workers[key] = w
 
     @staticmethod
-    def _key(candidate: HidCandidate) -> str:
+    def _key(candidate: HidCandidate | MvrCandidate) -> str:
         return candidate.serial or candidate.path.decode(errors="replace")
 
     # --- reports -------------------------------------------------------
@@ -778,6 +838,8 @@ class Service:
                 continue
             except Exception:
                 log.exception("probe failed for %s", key)
+                continue
+            if report is None:      # an MVR with no current status line
                 continue
             self._publish_report(report)
             out[key] = report

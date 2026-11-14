@@ -78,6 +78,10 @@ class Health:
     # self-report, not an independent measurement -- but the only honest
     # sigma available from a device that emits no pulse.
     naming_sigma_ns: int | None = None
+    # The device's own name for its fix, where it has one ("GPS fix",
+    # "DGPS fix", "RTK fixed", "RTK float", "dead reckoning", "unknown" on
+    # the MVR GPSDO B).  `gps_fix` stays the NMEA dimension ("2D"/"3D").
+    gps_fix_type: str | None = None
 
 
 @dataclass
@@ -88,6 +92,12 @@ class Outputs:
     out2_power: str | None = None
     pps_enabled: bool | None = None
     drive_ma: int | None = None
+    # MVR GPSDO B: requested frequency of each Si5351 output, 0 when that
+    # output is off, None when not yet read.  Named for the device's own
+    # outputs: which one feeds the SDR is wiring, not something to guess.
+    clk0_hz: int | None = None
+    clk1_hz: int | None = None
+    clk2_hz: int | None = None
 
 
 @dataclass
@@ -134,6 +144,25 @@ class ReceiverConfig:
 
 
 @dataclass
+class MvrReport:
+    """MVR GPSDO B stream state that has no home in Health/Outputs.
+
+    `gps_state` / `loop_state` are the device's own words ("fix", "no data",
+    "LOCKED", "unlocked", "LOST").  `passthrough` is the mode observed in the
+    stream; `passthrough_boot_default` is known only once the menu was seen."""
+
+    uptime_sec: int | None = None
+    gps_state: str | None = None
+    loop_state: str | None = None
+    passthrough: bool | None = None
+    passthrough_boot_default: bool | None = None
+    last_status_age_sec: float | None = None
+    halted: bool = False
+    firmware_built: str | None = None
+    bad_pmvr_checksum: int = 0
+
+
+@dataclass
 class FirmwareAdvisory:
     status: str                          # "current" | "outdated" | "unknown"
     protver: str | None = None
@@ -160,6 +189,11 @@ class DeviceReport:
     # divided by 60 -- how often the device actually sends a solution.
     # null on every other model, and until a full 60 s window has run.
     nav_pvt_rate_hz: float | None = None
+    # Human-readable operator advice for this device's current state (MVR:
+    # loop/fix/27 MHz/position).  Empty when there is none.
+    advisories: list[str] = field(default_factory=list)
+    # MVR GPSDO B only; null on every other model.
+    mvr: MvrReport | None = None
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), indent=2, sort_keys=False)
@@ -221,6 +255,8 @@ def new_report(
     nav_clock: NavClockReport | None = None,
     receiver_config: ReceiverConfig | None = None,
     nav_pvt_rate_hz: float | None = None,
+    advisories: list[str] | None = None,
+    mvr: MvrReport | None = None,
 ) -> DeviceReport:
     return DeviceReport(
         schema=SCHEMA_VERSION,
@@ -238,4 +274,6 @@ def new_report(
         nav_clock=nav_clock,
         receiver_config=receiver_config,
         nav_pvt_rate_hz=nav_pvt_rate_hz,
+        advisories=list(advisories or []),
+        mvr=mvr,
     )

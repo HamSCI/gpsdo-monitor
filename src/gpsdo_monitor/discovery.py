@@ -6,6 +6,7 @@ guess. The N:M topology cases in docs/TOPOLOGY.md depend on this.
 """
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 from gpsdo_monitor.config import DeclaredDevice
@@ -26,7 +27,7 @@ class DiscoveryResult:
         return not self.errors
 
 
-def match(declared: list[DeclaredDevice]) -> DiscoveryResult:
+def match(declared: list[DeclaredDevice], extra: Sequence = ()) -> DiscoveryResult:
     """Resolve declared entries against currently-plugged devices.
 
     Rules:
@@ -37,13 +38,19 @@ def match(declared: list[DeclaredDevice]) -> DiscoveryResult:
       - If `declared` is non-empty, each entry must find a device
         whose serial matches case-insensitively. Unmatched entries and
         unclaimed devices are both reported (neither fatal on its own).
+
+    `extra` adds candidates found outside HID -- confirmed MVR GPSDOs
+    (mvr.MvrCandidate, same shape as HidCandidate) -- and the same rules
+    apply across both families: a Bodnar and an MVR with nothing declared
+    is still a refusal to guess.
     """
-    present = enumerate_lbe()
+    present = list(enumerate_lbe()) + list(extra)
     errors: list[str] = []
 
     if not declared:
         if len(present) == 0:
-            return DiscoveryResult((), (), (), ("no Leo Bodnar devices found",))
+            return DiscoveryResult((), (), (), (
+                "no Leo Bodnar devices found" if not extra else "no GPSDO devices found",))
         if len(present) == 1:
             implicit = DeclaredDevice(serial=present[0].serial or "unknown", governs=())
             return DiscoveryResult(((implicit, present[0]),), (), (), ())
