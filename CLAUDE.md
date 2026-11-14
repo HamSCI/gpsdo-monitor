@@ -6,7 +6,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 **gpsdo-monitor** is a health monitor, mDNS advertiser, and
 configurator for [Leo Bodnar](http://www.leobodnar.com/) GPS-disciplined
-clock sources (LBE-1420 / LBE-1421 / LBE-1423 / LBE-Mini).
+clock sources (LBE-1420 / LBE-1421 / LBE-1423 / LBE-Mini), and for the
+MVR GPSDO B (serial-only; see "MVR GPSDO B" below).
 
 Its primary consumer is [`hf-timestd`](https://github.com/HamSCI/hf-timestd)'s
 authority manager: gpsdo-monitor publishes an **actively probed A-level**
@@ -36,11 +37,13 @@ uv run pytest tests/
 sudo ./install.sh
 
 # CLI
-gpsdo-monitor detect           # enumerate attached Leo Bodnar HIDs
+gpsdo-monitor detect           # enumerate Leo Bodnar HIDs and MVRs (listens up to 65 s per RP2040 tty)
 gpsdo-monitor status           # one-shot JSON dump per device
 gpsdo-monitor serve            # long-lived probe daemon (systemd)
 gpsdo-monitor tui              # Textual live-view TUI ([tui] extra)
 gpsdo-monitor config <...>     # manual debugging only; prefer `smd gpsdo config`
+gpsdo-monitor mvr probe        # MVR: read the menu header (service must be stopped)
+gpsdo-monitor mvr passthrough on|off [--persist]   # MVR: position needs passthrough on
 ```
 
 The canonical operator surface for configuration is **`smd gpsdo
@@ -90,7 +93,9 @@ src/gpsdo_monitor/
   advisories.py     # a_level_hint reasoning + UBX-MON-VER firmware advisory
   schema.py         # schema v1 dataclasses
   hid_xport.py      # HID feature-report transport
-  nmea.py           # NMEA fix parser (1421 / 1423 CDC stream)
+  nmea.py           # NMEA fix parser (1421 / 1423 CDC stream; MVR passthrough)
+  mvr.py            # MVR GPSDO B: stream parser, passive reader, discovery,
+                    #   report builder, and the console used by `mvr` commands
   ubx.py            # UBX NAV-PVT + MON-VER parser (Mini)
   pps.py            # DCD-edge capture via TIOCMIWAIT
   config.py         # device-configuration writes (frequencies, PPS, PLL/FLL)
@@ -120,6 +125,28 @@ deploy.toml         # sigmond client manifest
 The LBE-1421 is the actively-validated path. The other three drivers
 are byte-level-tested against captures from `bvernoux/lbe-142x` but
 have not been exercised against live hardware here.
+
+## MVR GPSDO B
+
+A Seeed XIAO RP2040 on USB CDC, no HID, so it bypasses `models/` and
+`hid_xport.py`. `mvr.MvrCandidate` has the same shape as `HidCandidate`,
+so `discovery.match()` and the service handle both families with one set
+of rules; `service.MvrWorker` stands beside `DeviceWorker`.
+
+- 2e8a:000a belongs to every RP2040 CDC board. Discovery listens, read-only,
+  for up to 65 s and calls a tty an MVR only once it prints a status line,
+  a lock event, the banner, the HALTED line or a `$PMVR,MSG,` sentence. Any
+  other RP2040 gets
+  its termios back and stays closed while it stays plugged in.
+- ⛔ The MVR opens its menu on the first printable byte it receives. Default
+  termios echoes the device's own output back to it, which opened N8UR's
+  menu on 2026-11-14. The monitor path opens the port `O_RDONLY`, takes an
+  exclusive `flock`, and sets raw termios (all echo flags, CR/NL translation
+  and IXON/IXOFF off) before the first read. Tests pin each of these.
+- Only `gpsdo-monitor mvr probe|passthrough` writes, and only the bytes in
+  `mvr.ALLOWED_WRITES`. They refuse while the service runs or holds the lock.
+- Position exists only in NMEA passthrough (off by default). Without it the
+  report carries no position and an advisory names the command.
 
 ## File / mDNS contract for consumers
 

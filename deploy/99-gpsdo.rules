@@ -1,4 +1,4 @@
-# udev rules for Leo Bodnar GPSDOs (VID 0x1dd2)
+# udev rules for Leo Bodnar GPSDOs (VID 0x1dd2) and the MVR GPSDO B (2e8a:000a)
 #
 # Grants the `gpsdo` group read/write access to:
 #   - the raw USB device node (/dev/bus/usb/NNN/MMM) — required by the
@@ -17,3 +17,12 @@ SUBSYSTEM=="hidraw", ATTRS{idVendor}=="1dd2", MODE="0660", GROUP="gpsdo"
 
 # CDC ACM — 1421/1423 stream NMEA here and carry 1PPS on DCD
 SUBSYSTEM=="tty", ATTRS{idVendor}=="1dd2", MODE="0660", GROUP="gpsdo"
+
+# MVR GPSDO B (Seeed XIAO RP2040, USB CDC only).  2e8a:000a is the generic
+# RP2040 CDC id that many boards share: gpsdo-monitor confirms an MVR from
+# what it prints, read-only, and leaves any other RP2040 alone.
+#
+# ⛔ The MVR opens its menu on the first printable byte it RECEIVES.  Keep
+# ModemManager from probing the port with "AT" commands, which would open it.
+SUBSYSTEM=="tty", ATTRS{idVendor}=="2e8a", ATTRS{idProduct}=="000a", ENV{ID_MM_DEVICE_IGNORE}="1"
+SUBSYSTEM=="tty", ATTRS{idVendor}=="2e8a", ATTRS{idProduct}=="000a", MODE="0660", GROUP="gpsdo"

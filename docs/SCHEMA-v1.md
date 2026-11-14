@@ -151,6 +151,65 @@ and from the one-shot `status` command, which runs no reader.
 "nav_pvt_rate_hz": 1.0
 ```
 
+## Additive fields for the MVR GPSDO B (added 2026-11-14, additive within v1)
+
+The MVR GPSDO B speaks over USB CDC only (see `src/gpsdo_monitor/mvr.py`).
+Its report keeps the v1 shape: `health.pll_locked` carries the loop lock,
+`health.gps_locked` the device's own fix test, and `gps_fix`, `sats_used`,
+`latitude`, `longitude`, `grid` and `altitude_m` come from the same NMEA
+reader the Leo Bodnars use, when the device runs in NMEA passthrough.
+Without passthrough the MVR reports no position at all, so the position
+fields stay `null` (never 0,0) and `advisories` names the command that
+turns passthrough on. `device.hid_path` holds the tty path, and
+`device.pid` reads `"0x000a"`. Old consumers ignore every field below.
+
+### `health.gps_fix_type`
+
+`string | null`. The device's own name for its fix, where it gives one:
+`"GPS fix"`, `"DGPS fix"`, `"RTK fixed"`, `"RTK float"`,
+`"dead reckoning"`, `"unknown"` on the MVR. `gps_fix` keeps its meaning,
+the NMEA dimension (`"no_fix"`, `"2D"`, `"3D"`).
+
+### `outputs.clk0_hz`, `outputs.clk1_hz`, `outputs.clk2_hz`
+
+`int | null`. MVR only: the requested frequency of each Si5351 output, as
+the status line prints it. `0` means the output runs powered down; `null`
+means no status line has arrived yet. The names follow the device's own
+outputs. Which output feeds the SDR depends on the wiring, and the daemon
+does not guess. `out1_hz` and `out2_hz` stay `null` on an MVR.
+`outputs.drive_ma` shows the drive the menu last displayed (2, 4, 6 or
+8 mA; 8 marks this device's maximum), or `null` until someone opens the menu.
+
+### `advisories`
+
+`list[string]`, empty when nothing needs saying. Plain operator advice for
+the device's current state. The MVR emits: loop not LOCKED; GPS without a
+fix; no 27 MHz on CLK0 or CLK1 (with both values); position unavailable
+(naming `gpsdo-monitor mvr passthrough on --persist`); firmware HALTED.
+Every other model publishes `[]` for now.
+
+### `mvr`
+
+`object | null`. MVR only; `null` on every other model.
+
+```jsonc
+"mvr": {
+  "uptime_sec": 110100,              // seconds since boot, from the status line
+  "gps_state": "fix",                // "fix" | "no data" | "LOCKED" | "LOST"
+  "loop_state": "LOCKED",            // "LOCKED" | "unlocked" | "no data" | "LOST"
+  "passthrough": false,              // mode seen in the stream
+  "passthrough_boot_default": null,  // known once the menu header was seen
+  "last_status_age_sec": 12.4,
+  "halted": false,
+  "firmware_built": "Oct  8 2026 09:50:46",
+  "bad_pmvr_checksum": 0
+}
+```
+
+The status line arrives every 30 s. When none has arrived for 75 s the
+daemon stops writing the file, so `written_utc` ages and consumers'
+staleness gates see the fault, as they do for a Mini whose probe fails.
+
 ## A-level mapping
 
 ```

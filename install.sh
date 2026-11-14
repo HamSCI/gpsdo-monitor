@@ -120,7 +120,7 @@ create_user() {
 }
 
 install_udev_rule() {
-    info "Installing udev rule for Leo Bodnar GPSDO..."
+    info "Installing udev rule for Leo Bodnar and MVR GPSDOs..."
     install -m 0644 "$REPO_ROOT/deploy/99-gpsdo.rules" /etc/udev/rules.d/99-gpsdo.rules
     udevadm control --reload-rules
     udevadm trigger --attr-match=subsystem=hidraw || true
