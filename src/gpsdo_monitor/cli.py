@@ -270,7 +270,9 @@ def _cmd_inventory(_args: argparse.Namespace) -> int:
     attached without probing USB itself.  gpsdo-monitor is a v0.4 infra
     client (no per-instance inventory); this reports only the hardware
     dimension.  hardware_present is True when at least one Leo Bodnar HID
-    device is enumerable, False when none, null if HID enumeration errors.
+    device is enumerable or an RP2040 CDC tty (a possible MVR, listed in
+    mvr_candidates) is present, False when none, null if HID enumeration
+    errors and no RP2040 is present.
     JSON only on stdout (logging goes to stderr)."""
     try:
         present: bool | None = bool(enumerate_lbe())
@@ -284,12 +286,24 @@ def _cmd_inventory(_args: argparse.Namespace) -> int:
                        for c in enumerate_unsupported_lbe()]
     except Exception:                                  # noqa: BLE001
         unsupported = []
+    # MVR GPSDO B: an RP2040 CDC tty (2e8a:000a) counts as present.  sysfs
+    # only -- inventory opens nothing, so it cannot confirm the MVR from its
+    # output; the service does that, and leaves any other RP2040 alone.
+    from gpsdo_monitor import mvr
+    try:
+        mvr_candidates = [{"tty": c.tty, "serial": c.serial, "product": c.product}
+                          for c in mvr.enumerate_rp2040_ttys()]
+    except Exception:                                  # noqa: BLE001
+        mvr_candidates = []
+    if mvr_candidates:
+        present = True
     payload = {
         "client":           "gpsdo-monitor",
         "version":          __version__,
         "contract_version": "0.8",
         "hardware_present": present,
         "unsupported_present": unsupported,
+        "mvr_candidates":   mvr_candidates,
     }
     print(json.dumps(payload, indent=2))
     return 0

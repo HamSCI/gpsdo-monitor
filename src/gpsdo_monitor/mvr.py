@@ -19,10 +19,13 @@ to the device -- on N8UR (2026-11-14) that opened the menu and fed echoed menu
 lines back as selections; an echoed "7) Restore compile-time defaults" could
 have reset CLK1.  So:
 
-  - the monitor path opens the port O_RDONLY (a write is structurally
-    impossible) and puts it in raw mode, every echo flag off, no CR/NL
-    translation, no software flow control (IXOFF would make the KERNEL send
-    XOFF/XON bytes), BEFORE the first read;
+  - the monitor path opens the port O_RDONLY, which blocks writes from
+    userspace only.  The KERNEL's line discipline still echoes until termios
+    changes, so open_port() puts the port in raw mode -- every echo flag off,
+    no CR/NL translation, no software flow control (IXOFF would make the
+    kernel send XOFF/XON bytes) -- immediately after open() and its flock(),
+    BEFORE the first read.  Bytes arriving inside that microsecond window can
+    still echo; nothing may ever be inserted between open() and tcsetattr();
   - only the explicit `gpsdo-monitor mvr probe|passthrough` commands
     (MvrConsole) write, and only the bytes in ALLOWED_WRITES.
 
@@ -462,8 +465,15 @@ class MvrReader:
     not count toward the window."""
 
     def __init__(self, tty_path: str, *, confirm_window_sec: float = CONFIRM_WINDOW_SEC,
-                 reopen_backoff_sec: float = 1.0) -> None:
+                 reopen_backoff_sec: float = 1.0, serial: str | None = None,
+                 serial_lookup: Callable[[str], str | None] | None = None) -> None:
         self.tty_path = str(tty_path)
+        # The USB serial this tty carried when found.  Checked before every
+        # open: after an unplug, another device can take the same ttyACM
+        # number, and the reader must not open it.  None skips the check.
+        self.serial = serial or None
+        self.serial_lookup = serial_lookup
+        self.gone = False
         self.confirm_window_sec = confirm_window_sec
         self.reopen_backoff_sec = reopen_backoff_sec
         self._state = MvrState()
@@ -498,8 +508,19 @@ class MvrReader:
         with self._lock:
             return copy_state(self._state)
 
+    def _still_ours(self) -> bool:
+        if self.serial is None:
+            return True
+        lookup = self.serial_lookup or tty_usb_serial
+        return lookup(self.tty_path) == self.serial
+
     def _run(self) -> None:
         while not self._stop.is_set():
+            if not self._still_ours():
+                self.gone = True
+                log.info("%s no longer carries USB serial %s; not reopening it",
+                         self.tty_path, self.serial)
+                return
             try:
                 fd, orig = open_port(self.tty_path)
             except PortBusy as e:
@@ -590,6 +611,16 @@ def _read_sysfs(p: Path) -> str | None:
         return None
 
 
+def tty_usb_serial(tty_path: str) -> str | None:
+    """The USB serial of the 2e8a:000a device behind `tty_path` now, or None
+    when the tty is gone or belongs to some other device.  sysfs only."""
+    name = Path(tty_path).name
+    for c in enumerate_rp2040_ttys():
+        if Path(c.tty).name == name:
+            return c.serial
+    return None
+
+
 def enumerate_rp2040_ttys(sys_tty: Path | None = None) -> list[MvrCandidate]:
     """Every /dev/ttyACM* whose USB device is 2e8a:000a.  sysfs only: this
     opens nothing."""
@@ -656,12 +687,18 @@ class MvrProber:
                 continue
             log.info("%s: RP2040 %04x:%04x (%s) -- listening up to %.0f s for an MVR",
                      c.tty, c.vid, c.pid, c.product or "?", self.confirm_window_sec)
-            r = self.reader_factory(c.tty, confirm_window_sec=self.confirm_window_sec)
+            r = self.reader_factory(c.tty, confirm_window_sec=self.confirm_window_sec,
+                                    serial=c.serial or None)
             r.start()
             self._readers[k] = (c, r)
         confirmed: list[MvrCandidate] = []
         for k, (c, r) in list(self._readers.items()):
-            if r.rejected:
+            if getattr(r, "gone", False):
+                # Its tty now belongs to another device; the next scan
+                # starts a fresh reader for whatever sits there.
+                r.stop()
+                del self._readers[k]
+            elif r.rejected:
                 r.stop()
                 del self._readers[k]
                 self._rejected.add(k)
@@ -853,6 +890,10 @@ class MvrConsole:
     of typing into the unknown; the menu closes itself after 30 s idle."""
 
     PROMPT = "> "
+    # The last line of the menu header.  "> " alone proves nothing: the boot
+    # transcript prints the same banner and then "... -> locked timepulse".
+    MENU_END = "99) Exit menu"
+    BANNER = "=== MVR GPSDO B Firmware"
 
     def __init__(self, port, *, timeout_sec: float = 5.0) -> None:
         self.port = port
@@ -880,15 +921,35 @@ class MvrConsole:
             if chunk:
                 self._buf += chunk.decode("ascii", errors="replace")
 
+    def _wait_menu(self) -> str:
+        """Read until a "> " prompt that follows the "99) Exit menu" line;
+        return the text before that prompt."""
+        deadline = time.monotonic() + self.timeout_sec
+        while True:
+            end = self._buf.find(self.MENU_END)
+            if end >= 0:
+                p = self._buf.find(self.PROMPT, end)
+                if p >= 0:
+                    return self._buf[:p]
+            left = deadline - time.monotonic()
+            if left <= 0:
+                raise MvrTimeout(f"no menu (a {self.MENU_END!r} line, then the prompt) "
+                                 f"within {self.timeout_sec:.0f} s; sent nothing further")
+            chunk = self.port.read(min(left, 0.1))
+            if chunk:
+                self._buf += chunk.decode("ascii", errors="replace")
+
     def _open_menu(self) -> MenuInfo:
         self._send(b"\r")
-        _t, text = self._wait_for(self.PROMPT)
+        text = self._wait_menu()
+        end = text.rfind(self.MENU_END)
+        start = text.rfind(self.BANNER, 0, end)
+        if start < 0:
+            raise MvrConsoleError("a menu came back without the MVR GPSDO B "
+                                  "banner; sent nothing further")
         info = MenuInfo()
-        for ln in text.replace("\r", "").split("\n"):
+        for ln in text[start:].replace("\r", "").split("\n"):
             apply_menu_line(info, ln)
-        if info.firmware is None:
-            raise MvrConsoleError("a prompt came back without the MVR GPSDO B "
-                                  "menu header; sent nothing further")
         return info
 
     def _exit_menu(self) -> str:
@@ -912,6 +973,13 @@ class MvrConsole:
     def probe(self) -> MenuInfo:
         info = self._open_menu()
         info.exit_line = self._exit_menu()
+        if not info.complete:
+            missing = [n for n, v in (("firmware", info.firmware),
+                                      ("CLK0..2", None if None in info.clk_hz else 1),
+                                      ("drive", info.drive_ma),
+                                      ("passthrough", info.passthrough)) if v is None]
+            raise MvrConsoleError("menu header incomplete (missing "
+                                  f"{', '.join(missing)}); closed the menu")
         return info
 
     def set_passthrough(self, on: bool, *, persist: bool) -> PassthroughResult:
@@ -934,7 +1002,13 @@ class MvrConsole:
             tok, _ = self._wait_for("Saved", "Not persisted")
             if tok == "Saved":
                 boot = None               # learned below from the exit state
-            self._wait_for(self.PROMPT)
+            try:
+                self._wait_for(self.PROMPT)
+            except MvrTimeout:
+                raise MvrTimeout(
+                    "no prompt after the persist answer, so 99 was not sent; the "
+                    "change may still apply when the menu times out in 30 s -- "
+                    "check with `gpsdo-monitor mvr probe` after that") from None
         exit_line = self._exit_menu()
         now_on = "resuming NMEA passthrough" in exit_line
         if not now_on and "back to normal status output" not in exit_line:
